@@ -584,12 +584,45 @@ def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | 
     }
 
 
+def get_evaluated_team_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
+    rows = conn.execute("SELECT team_id FROM evaluations WHERE juror_id = ?", (juror_id,)).fetchall()
+    return {row["team_id"] for row in rows}
+
+
+def get_next_pending_team_id(
+    conn: sqlite3.Connection,
+    juror_id: int,
+    team_rows: list[sqlite3.Row],
+    after_team_id: int | None = None,
+) -> int | None:
+    """Return the first team (in display order) the juror hasn't evaluated yet.
+
+    If ``after_team_id`` is given, search starts right after that team and wraps
+    around the full list. If every team is already evaluated, falls back to
+    ``after_team_id`` (or the first team) so there's always something to show.
+    """
+    if not team_rows:
+        return None
+    evaluated_ids = get_evaluated_team_ids(conn, juror_id)
+    ids = [row["id"] for row in team_rows]
+    start_index = 0
+    if after_team_id is not None and after_team_id in ids:
+        start_index = ids.index(after_team_id) + 1
+    for idx in range(start_index, len(ids)):
+        if ids[idx] not in evaluated_ids:
+            return ids[idx]
+    for idx in range(0, start_index):
+        if ids[idx] not in evaluated_ids:
+            return ids[idx]
+    return after_team_id if after_team_id is not None else ids[0]
+
+
 def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | None = None) -> dict[str, Any]:
     ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
     team_rows = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
     team_summary = [serialize_team(stats_by_id[row["id"]]) for row in team_rows]
     if team_id is None:
-        team_id = team_rows[0]["id"] if team_rows else None
+        team_id = get_next_pending_team_id(conn, juror_id, team_rows)
     team_detail = get_team_detail(conn, team_id) if team_id is not None else None
     current_eval = None
     if team_id is not None:
@@ -683,8 +716,8 @@ def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payl
     if error:
         raise ValueError(error)
     observations = str(payload.get("observations", "")).strip()
-    if observations is None:
-        observations = ""
+    if not observations:
+        raise ValueError("Debe escribir observaciones antes de guardar la evaluación.")
     final_score_5 = round(
         scores["problem_score"] * 0.20
         + scores["value_score"] * 0.25
@@ -980,8 +1013,16 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                     send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
                     return
                 saved = store_evaluation(conn, int(team_id_text), user["id"], payload)
-                dashboard = get_jury_dashboard(conn, user["id"], int(team_id_text))
-            send_json(self, {"ok": True, "message": "Evaluación guardada correctamente.", "evaluation": saved, "dashboard": dashboard})
+                team_rows = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+                next_team_id = get_next_pending_team_id(conn, user["id"], team_rows, int(team_id_text))
+                dashboard = get_jury_dashboard(conn, user["id"], next_team_id)
+            all_done = dashboard["progress"]["pending"] == 0
+            message = (
+                "¡Evaluación guardada! Ya calificaste todos los equipos."
+                if all_done
+                else "Evaluación guardada correctamente. Mostrando el siguiente equipo."
+            )
+            send_json(self, {"ok": True, "message": message, "evaluation": saved, "dashboard": dashboard})
         except ValueError as exc:
             send_error_json(self, HTTPStatus.BAD_REQUEST, str(exc))
         except sqlite3.IntegrityError:

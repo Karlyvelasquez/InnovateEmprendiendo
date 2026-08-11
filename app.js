@@ -128,7 +128,9 @@ function teamSummaryText(team) {
 }
 
 function isDraftComplete(draft) {
-  return scoreFields.every((key) => Number.isInteger(draft?.scores?.[key]) && draft.scores[key] >= 1 && draft.scores[key] <= 5);
+  const scoresOk = scoreFields.every((key) => Number.isInteger(draft?.scores?.[key]) && draft.scores[key] >= 1 && draft.scores[key] <= 5);
+  const observationsOk = Boolean((draft?.observations || '').trim());
+  return scoresOk && observationsOk;
 }
 
 function buildDraftFromEvaluation(evaluation) {
@@ -190,7 +192,6 @@ function renderAdminDashboard() {
   const selectedTeam = selected?.team || null;
   const selectedRanking = selectedTeam?.position || '—';
   const selectedEvaluations = selected?.evaluations || [];
-  const selectedHistory = selected?.history || [];
 
   const summaryCards = `
     <section class="summary-grid">
@@ -262,20 +263,6 @@ function renderAdminDashboard() {
       `).join('')
     : '<div class="empty-state">Todavía no existen evaluaciones para este equipo.</div>';
 
-  const historyList = selectedHistory.length
-    ? selectedHistory.map((item, index) => `
-        <article class="history-item">
-          <div class="history-item__top">
-            <div>
-              <h4>Snapshot ${index + 1}</h4>
-              <small>${formatDate(item.recorded_at)}</small>
-            </div>
-            <span class="mini-pill" data-status="Evaluado">Posición #${item.position}</span>
-          </div>
-          <p>Puntaje promedio: <strong>${formatNumber(item.score_5, 2)} / 5</strong> · ${formatNumber(item.score_100, 1)} / 100</p>
-        </article>
-      `).join('')
-    : '<div class="empty-state">Aún no hay historial de posiciones para este equipo.</div>';
 
   const teamDetail = selectedTeam
     ? `
@@ -315,10 +302,6 @@ function renderAdminDashboard() {
           <div>
             <p class="section-label">Evaluaciones jurado por jurado</p>
             <div class="evaluation-list">${jurorEvaluations}</div>
-          </div>
-          <div>
-            <p class="section-label">Evolución del ranking</p>
-            <div class="history-list">${historyList}</div>
           </div>
         </div>
       </article>
@@ -506,8 +489,8 @@ function renderJuryDashboard() {
 
       <section class="observations-card">
         <p class="section-label">Observaciones</p>
-        <h3>Comentarios para el equipo</h3>
-        <textarea id="jury-observations" placeholder="Escriba aquí sus observaciones...">${escapeHtml(currentDraft.observations || '')}</textarea>
+        <h3>Comentarios para el equipo <span class="required-marker">*</span></h3>
+        <textarea id="jury-observations" placeholder="Escriba aquí sus observaciones (obligatorio)..." required>${escapeHtml(currentDraft.observations || '')}</textarea>
         ${currentEvaluationCard}
       </section>
 
@@ -638,11 +621,8 @@ async function handleLogin(event) {
       method: 'POST',
       body: JSON.stringify({ identifier, password }),
     });
-    state.authenticated = true;
-    state.user = payload.user;
-    state.role = payload.user.role;
     dom.loginFeedback.textContent = 'Inicio de sesión correcto.';
-    await loadDashboard();
+    await loadBootstrap();
     setToast(`Bienvenido, ${payload.user.name}.`);
   } catch (error) {
     dom.loginFeedback.textContent = error.message;
@@ -673,8 +653,14 @@ async function forceLogout(showMessage = true) {
 
 async function handleSaveEvaluation() {
   if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
-  if (!isDraftComplete(state.juryDraft)) {
+  const scoresOk = scoreFields.every((key) => Number.isInteger(state.juryDraft?.scores?.[key]) && state.juryDraft.scores[key] >= 1 && state.juryDraft.scores[key] <= 5);
+  const observationsOk = Boolean((state.juryDraft?.observations || '').trim());
+  if (!scoresOk) {
     setToast('Completa las cinco rúbricas antes de guardar.', 'error');
+    return;
+  }
+  if (!observationsOk) {
+    setToast('Escribe una observación antes de guardar.', 'error');
     return;
   }
 
@@ -693,7 +679,7 @@ async function handleSaveEvaluation() {
       body: JSON.stringify(payload),
     });
     state.dashboard = response.dashboard;
-    state.juryDraft = buildDraftFromEvaluation(response.evaluation);
+    state.juryDraft = buildDraftFromEvaluation(response.dashboard.current_evaluation);
     state.juryDirty = false;
     state.activeTeamId = response.dashboard.current_team_id;
     render();
@@ -787,6 +773,10 @@ function handleRootInput(event) {
     state.juryDraft = state.juryDraft || buildDraftFromEvaluation(null);
     state.juryDraft.observations = target.value;
     state.juryDirty = true;
+    const saveButton = document.querySelector('[data-action="jury-save"]');
+    if (saveButton) {
+      saveButton.disabled = !isDraftComplete(state.juryDraft);
+    }
     return;
   }
 
