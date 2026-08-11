@@ -1,0 +1,1004 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import sqlite3
+import zipfile
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from functools import partial
+from http import HTTPStatus
+from http.cookies import SimpleCookie
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+import xml.etree.ElementTree as ET
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "innovate_pitch.db"
+EXCEL_PATH = ROOT / "Programación_I_pitch_con_descripcion.xlsx"
+SESSION_COOKIE = "innovate_pitch_session"
+SESSION_TTL_HOURS = 24 * 7
+PBKDF2_ITERATIONS = 210_000
+
+ROLE_ADMIN = "admin"
+ROLE_JURY = "jury"
+
+SEED_USERS = [
+    {"name": "Administradora EPM", "identifier": "admin@innovate.pitch", "password": "admin123", "role": ROLE_ADMIN},
+    {"name": "Juan Pérez", "identifier": "juan.perez@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
+    {"name": "Ana García", "identifier": "ana.garcia@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
+    {"name": "Carlos Rojas", "identifier": "carlos.rojas@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
+    {"name": "Laura Gómez", "identifier": "laura.gomez@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
+]
+
+RUBRICS = [
+    {
+        "key": "problem_score",
+        "label": "Identificación del problema",
+        "weight": 0.20,
+        "description": "Evalúa la claridad con la que se identifica y sustenta el problema, demostrando su relevancia y el impacto que genera en los usuarios.",
+    },
+    {
+        "key": "value_score",
+        "label": "Propuesta de valor",
+        "weight": 0.25,
+        "description": "Evalúa qué tan innovadora, diferenciadora y pertinente es la solución planteada para responder al problema identificado, así como el valor que aporta a los usuarios.",
+    },
+    {
+        "key": "validation_score",
+        "label": "Validación de la solución",
+        "weight": 0.20,
+        "description": "Evalúa la evidencia que respalda la propuesta, considerando pruebas realizadas, pilotos, entrevistas, retroalimentación de usuarios o resultados obtenidos.",
+    },
+    {
+        "key": "business_score",
+        "label": "Modelo de negocio",
+        "weight": 0.20,
+        "description": "Evalúa la claridad y viabilidad del modelo de negocio propuesto. Considera si la solución genera y captura valor, identifica clientes, fuentes de ingresos, recursos, actividades clave y su potencial de crecimiento.",
+    },
+    {
+        "key": "pitch_score",
+        "label": "Calidad del pitch",
+        "weight": 0.15,
+        "description": "Evalúa la claridad, organización y capacidad de comunicación durante la presentación, el manejo del tiempo, el dominio del tema y la respuesta a las preguntas del jurado.",
+    },
+]
+
+RUBRIC_KEYS = [item["key"] for item in RUBRICS]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso_now() -> str:
+    return utc_now().isoformat(timespec="seconds")
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def pbkdf2_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        PBKDF2_ITERATIONS,
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations_int = int(iterations)
+        salt = base64.urlsafe_b64decode(salt_b64.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_b64.encode("ascii"))
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations_int)
+        return hmac.compare_digest(candidate, expected)
+    except Exception:
+        return False
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            identifier TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'jury')),
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            display_order INTEGER NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            leader TEXT NOT NULL,
+            country TEXT NOT NULL,
+            university TEXT NOT NULL,
+            filial TEXT,
+            theme_line TEXT NOT NULL,
+            source_row INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            juror_id INTEGER NOT NULL,
+            problem_score INTEGER NOT NULL,
+            value_score INTEGER NOT NULL,
+            validation_score INTEGER NOT NULL,
+            business_score INTEGER NOT NULL,
+            pitch_score INTEGER NOT NULL,
+            observations TEXT NOT NULL DEFAULT '',
+            final_score_5 REAL NOT NULL,
+            final_score_100 REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(team_id, juror_id),
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
+            FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS ranking_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            evaluation_id INTEGER,
+            position INTEGER NOT NULL,
+            score_5 REAL NOT NULL,
+            score_100 REAL NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
+            FOREIGN KEY(evaluation_id) REFERENCES evaluations(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def seed_users(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["identifier"]
+        for row in conn.execute("SELECT identifier FROM users")
+    }
+    for user in SEED_USERS:
+        if user["identifier"] in existing:
+            continue
+        conn.execute(
+            "INSERT INTO users (name, identifier, password_hash, role, active) VALUES (?, ?, ?, ?, 1)",
+            (user["name"], user["identifier"], pbkdf2_hash(user["password"]), user["role"]),
+        )
+
+
+def shared_strings_from_xlsx(zip_file: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in zip_file.namelist():
+        return []
+    namespace = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    tree = ET.fromstring(zip_file.read("xl/sharedStrings.xml"))
+    values: list[str] = []
+    for item in tree.findall("a:si", namespace):
+        values.append("".join(node.text or "" for node in item.iterfind(".//a:t", namespace)))
+    return values
+
+
+def cell_text(cell: ET.Element, shared_strings: list[str], namespace: dict[str, str]) -> str:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "s":
+        value = cell.find("a:v", namespace)
+        return shared_strings[int(value.text)] if value is not None and value.text is not None else ""
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.iterfind(".//a:t", namespace))
+    value = cell.find("a:v", namespace)
+    return value.text if value is not None and value.text is not None else ""
+
+
+def parse_pitch_workbook() -> list[dict[str, Any]]:
+    if not EXCEL_PATH.exists():
+        return []
+
+    namespace = {
+        "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "p": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+
+    rows: list[dict[str, Any]] = []
+    with zipfile.ZipFile(EXCEL_PATH) as workbook:
+        workbook_xml = ET.fromstring(workbook.read("xl/workbook.xml"))
+        rels_xml = ET.fromstring(workbook.read("xl/_rels/workbook.xml.rels"))
+        relmap = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels_xml}
+        shared_strings = shared_strings_from_xlsx(workbook)
+        sheet = workbook_xml.find("a:sheets/a:sheet", namespace)
+        if sheet is None:
+            return []
+        sheet_target = "xl/" + relmap[sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]]
+        sheet_xml = ET.fromstring(workbook.read(sheet_target))
+        sheet_rows = sheet_xml.findall("a:sheetData/a:row", namespace)
+        if not sheet_rows:
+            return []
+
+        headers = [cell_text(cell, shared_strings, namespace).strip() for cell in sheet_rows[0].findall("a:c", namespace)]
+        for source_row, row in enumerate(sheet_rows[1:], start=2):
+            values = [cell_text(cell, shared_strings, namespace).strip() for cell in row.findall("a:c", namespace)]
+            row_map = {headers[index]: values[index] if index < len(values) else "" for index in range(len(headers))}
+            team_name = row_map.get("Nombre del equipo", "").strip()
+            if not team_name:
+                continue
+            rows.append(
+                {
+                    "display_order": len(rows) + 1,
+                    "name": team_name,
+                    "description": row_map.get("Descripción del proyecto", "").strip(),
+                    "leader": row_map.get("Nombre Completo particpante lider", row_map.get("Nombre Completo particpante lider\n", "")).strip(),
+                    "country": row_map.get("Pais", "").strip(),
+                    "university": row_map.get("Universidad/Filial", "").strip(),
+                    "filial": "",
+                    "theme_line": row_map.get("Línea temática", "").strip(),
+                    "source_row": source_row,
+                }
+            )
+    return rows
+
+
+def seed_teams(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0]:
+        return
+    teams = parse_pitch_workbook()
+    for team in teams:
+        conn.execute(
+            """
+            INSERT INTO teams (
+                display_order, name, description, leader, country, university, filial, theme_line, source_row
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                team["display_order"],
+                team["name"],
+                team["description"],
+                team["leader"],
+                team["country"],
+                team["university"],
+                team["filial"],
+                team["theme_line"],
+                team["source_row"],
+            ),
+        )
+
+
+def average(values: list[float]) -> float:
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
+def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]], int]:
+    teams = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+    users = conn.execute("SELECT * FROM users WHERE active = 1").fetchall()
+    jurors = [user for user in users if user["role"] == ROLE_JURY]
+    eval_rows = conn.execute(
+        """
+        SELECT e.*, u.name AS juror_name, u.identifier AS juror_identifier
+        FROM evaluations e
+        INNER JOIN users u ON u.id = e.juror_id
+        ORDER BY e.updated_at DESC, e.id DESC
+        """
+    ).fetchall()
+
+    evaluations_by_team: dict[int, list[sqlite3.Row]] = defaultdict(list)
+    for row in eval_rows:
+        evaluations_by_team[row["team_id"]].append(row)
+
+    teams_stats: list[dict[str, Any]] = []
+    stats_by_id: dict[int, dict[str, Any]] = {}
+    evaluations_by_team_serialized: dict[int, list[dict[str, Any]]] = {}
+
+    for team in teams:
+        team_evaluations = evaluations_by_team.get(team["id"], [])
+        rubric_averages = {
+            rubric["key"]: average([float(item[rubric["key"]]) for item in team_evaluations])
+            for rubric in RUBRICS
+        }
+        final_5_values = [float(item["final_score_5"]) for item in team_evaluations]
+        final_100_values = [float(item["final_score_100"]) for item in team_evaluations]
+        average_5 = average(final_5_values)
+        average_100 = average(final_100_values)
+        evaluation_count = len(team_evaluations)
+        if evaluation_count == 0:
+            status = "Pendiente"
+        elif evaluation_count < len(jurors):
+            status = "En progreso"
+        else:
+            status = "Evaluado"
+
+        serialized_evaluations = [
+            {
+                "id": item["id"],
+                "juror_id": item["juror_id"],
+                "juror_name": item["juror_name"],
+                "juror_identifier": item["juror_identifier"],
+                "problem_score": item["problem_score"],
+                "value_score": item["value_score"],
+                "validation_score": item["validation_score"],
+                "business_score": item["business_score"],
+                "pitch_score": item["pitch_score"],
+                "observations": item["observations"],
+                "final_score_5": round(float(item["final_score_5"]), 4),
+                "final_score_100": round(float(item["final_score_100"]), 4),
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+            }
+            for item in team_evaluations
+        ]
+
+        stats = {
+            "id": team["id"],
+            "display_order": team["display_order"],
+            "name": team["name"],
+            "description": team["description"],
+            "leader": team["leader"],
+            "country": team["country"],
+            "university": team["university"],
+            "filial": team["filial"] or "",
+            "theme_line": team["theme_line"],
+            "source_row": team["source_row"],
+            "evaluation_count": evaluation_count,
+            "average_5": round(average_5, 4),
+            "average_100": round(average_100, 4),
+            "rubric_averages": {key: round(value, 4) for key, value in rubric_averages.items()},
+            "status": status,
+            "evaluations": serialized_evaluations,
+        }
+        teams_stats.append(stats)
+        stats_by_id[team["id"]] = stats
+        evaluations_by_team_serialized[team["id"]] = serialized_evaluations
+
+    ranking = sorted(
+        teams_stats,
+        key=lambda item: (-item["average_5"], -item["evaluation_count"], item["display_order"], item["name"].lower()),
+    )
+    for index, item in enumerate(ranking, start=1):
+        item["position"] = index
+        stats_by_id[item["id"]]["position"] = index
+
+    return ranking, stats_by_id, evaluations_by_team_serialized, len(jurors)
+
+
+def record_ranking_history(conn: sqlite3.Connection, evaluation_id: int | None = None) -> None:
+    ranking, _, _, _ = compute_team_stats(conn)
+    recorded_at = iso_now()
+    for item in ranking:
+        conn.execute(
+            """
+            INSERT INTO ranking_history (team_id, evaluation_id, position, score_5, score_100, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (item["id"], evaluation_id, item["position"], item["average_5"], item["average_100"], recorded_at),
+        )
+
+
+def seed_initial_history(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) FROM ranking_history").fetchone()[0]:
+        return
+    record_ranking_history(conn, None)
+
+
+def initialize_database() -> None:
+    with db_connect() as conn:
+        ensure_schema(conn)
+        seed_users(conn)
+        seed_teams(conn)
+        seed_initial_history(conn)
+        conn.commit()
+
+
+def parse_cookie(header_value: str | None) -> SimpleCookie:
+    cookie = SimpleCookie()
+    if header_value:
+        cookie.load(header_value)
+    return cookie
+
+
+def get_session_user(conn: sqlite3.Connection, headers: dict[str, str]) -> sqlite3.Row | None:
+    cookie = parse_cookie(headers.get("Cookie"))
+    morsel = cookie.get(SESSION_COOKIE)
+    if morsel is None:
+        return None
+    token = morsel.value
+    row = conn.execute(
+        """
+        SELECT u.*
+        FROM sessions s
+        INNER JOIN users u ON u.id = s.user_id
+        WHERE s.token = ? AND s.expires_at > ? AND u.active = 1
+        """,
+        (token, iso_now()),
+    ).fetchone()
+    if row is None:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        conn.commit()
+        return None
+    conn.execute("UPDATE sessions SET last_seen_at = ? WHERE token = ?", (iso_now(), token))
+    conn.commit()
+    return row
+
+
+def create_session(conn: sqlite3.Connection, user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = (utc_now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT INTO sessions (token, user_id, expires_at, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?)",
+        (token, user_id, expires_at, iso_now(), iso_now()),
+    )
+    conn.commit()
+    return token
+
+
+def clear_session(conn: sqlite3.Connection, token: str | None) -> None:
+    if not token:
+        return
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+
+
+def load_json(request: SimpleHTTPRequestHandler) -> dict[str, Any]:
+    length = int(request.headers.get("Content-Length", "0") or 0)
+    if length <= 0:
+        return {}
+    raw = request.rfile.read(length)
+    if not raw:
+        return {}
+    for encoding in ("utf-8", "utf-8-sig", "utf-16-le", "utf-16"):
+        try:
+            return json.loads(raw.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("El cuerpo de la solicitud no es válido.")
+
+
+def send_json(handler: SimpleHTTPRequestHandler, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK, extra_headers: dict[str, str] | None = None) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    if extra_headers:
+        for key, value in extra_headers.items():
+            handler.send_header(key, value)
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def send_error_json(handler: SimpleHTTPRequestHandler, status: HTTPStatus, message: str) -> None:
+    send_json(handler, {"ok": False, "error": message}, status=status)
+
+
+def require_user(handler: "InnovatePitchHandler", role: str | None = None) -> sqlite3.Row | None:
+    with db_connect() as conn:
+        user = get_session_user(conn, handler.headers)
+        if user is None:
+            send_error_json(handler, HTTPStatus.UNAUTHORIZED, "Sesión no iniciada.")
+            return None
+        if role and user["role"] != role:
+            send_error_json(handler, HTTPStatus.FORBIDDEN, "No tiene permisos para acceder a este recurso.")
+            return None
+        return user
+
+
+def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": user["id"],
+        "name": user["name"],
+        "identifier": user["identifier"],
+        "role": user["role"],
+        "active": bool(user["active"]),
+        "created_at": user["created_at"],
+    }
+
+
+def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": team["id"],
+        "display_order": team["display_order"],
+        "name": team["name"],
+        "description": team["description"],
+        "leader": team["leader"],
+        "country": team["country"],
+        "university": team["university"],
+        "filial": team["filial"],
+        "theme_line": team["theme_line"],
+        "source_row": team["source_row"],
+        "evaluation_count": team["evaluation_count"],
+        "average_5": team["average_5"],
+        "average_100": team["average_100"],
+        "rubric_averages": team["rubric_averages"],
+        "status": team["status"],
+        "position": team.get("position"),
+    }
+
+
+def get_team_detail(conn: sqlite3.Connection, team_id: int) -> dict[str, Any] | None:
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
+    team = stats_by_id.get(team_id)
+    if team is None:
+        return None
+    history_rows = conn.execute(
+        """
+        SELECT rh.position, rh.score_5, rh.score_100, rh.recorded_at, e.updated_at AS evaluation_updated_at
+        FROM ranking_history rh
+        LEFT JOIN evaluations e ON e.id = rh.evaluation_id
+        WHERE rh.team_id = ?
+        ORDER BY rh.recorded_at ASC, rh.id ASC
+        """,
+        (team_id,),
+    ).fetchall()
+    team_history = [
+        {
+            "position": row["position"],
+            "score_5": round(float(row["score_5"]), 4),
+            "score_100": round(float(row["score_100"]), 4),
+            "recorded_at": row["recorded_at"],
+            "evaluation_updated_at": row["evaluation_updated_at"],
+        }
+        for row in history_rows
+    ]
+    juror_progress = {
+        "total_jurors": juror_count,
+        "evaluations_count": team["evaluation_count"],
+        "pending_count": max(juror_count - team["evaluation_count"], 0),
+        "status": team["status"],
+    }
+    evaluations = team["evaluations"]
+    return {
+        "team": serialize_team(team),
+        "history": team_history,
+        "juror_progress": juror_progress,
+        "evaluations": evaluations,
+        "ranking": ranking,
+    }
+
+
+def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | None = None) -> dict[str, Any]:
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
+    team_rows = conn.execute("SELECT * FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+    team_summary = [serialize_team(stats_by_id[row["id"]]) for row in team_rows]
+    if team_id is None:
+        team_id = team_rows[0]["id"] if team_rows else None
+    team_detail = get_team_detail(conn, team_id) if team_id is not None else None
+    current_eval = None
+    if team_id is not None:
+        current_eval_row = conn.execute(
+            """
+            SELECT *
+            FROM evaluations
+            WHERE team_id = ? AND juror_id = ?
+            """,
+            (team_id, juror_id),
+        ).fetchone()
+        if current_eval_row is not None:
+            current_eval = {
+                "id": current_eval_row["id"],
+                "team_id": current_eval_row["team_id"],
+                "juror_id": current_eval_row["juror_id"],
+                "problem_score": current_eval_row["problem_score"],
+                "value_score": current_eval_row["value_score"],
+                "validation_score": current_eval_row["validation_score"],
+                "business_score": current_eval_row["business_score"],
+                "pitch_score": current_eval_row["pitch_score"],
+                "observations": current_eval_row["observations"],
+                "final_score_5": round(float(current_eval_row["final_score_5"]), 4),
+                "final_score_100": round(float(current_eval_row["final_score_100"]), 4),
+                "created_at": current_eval_row["created_at"],
+                "updated_at": current_eval_row["updated_at"],
+            }
+    completed_count = conn.execute(
+        "SELECT COUNT(*) FROM evaluations WHERE juror_id = ?",
+        (juror_id,),
+    ).fetchone()[0]
+    current_index = 0
+    if team_id is not None:
+        for index, row in enumerate(team_rows):
+            if row["id"] == team_id:
+                current_index = index
+                break
+    return {
+        "teams": team_summary,
+        "current_team_id": team_id,
+        "current_index": current_index,
+        "current_team": team_detail["team"] if team_detail else None,
+        "current_team_detail": team_detail,
+        "current_evaluation": current_eval,
+        "progress": {
+            "assigned": len(team_rows),
+            "completed": completed_count,
+            "pending": max(len(team_rows) - completed_count, 0),
+            "percent": round((completed_count / len(team_rows) * 100) if team_rows else 0, 1),
+        },
+        "ranking": ranking,
+        "juror_count": juror_count,
+    }
+
+
+def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None = None) -> dict[str, Any]:
+    ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
+    if selected_team_id is None and ranking:
+        selected_team_id = ranking[0]["id"]
+    team_detail = get_team_detail(conn, selected_team_id) if selected_team_id is not None else None
+    jurors = [serialize_user(user) for user in conn.execute("SELECT * FROM users WHERE role = ? ORDER BY name ASC", (ROLE_JURY,)).fetchall()]
+    admins = [serialize_user(user) for user in conn.execute("SELECT * FROM users WHERE role = ? ORDER BY name ASC", (ROLE_ADMIN,)).fetchall()]
+    return {
+        "ranking": ranking,
+        "selected_team": team_detail,
+        "jurors": jurors,
+        "admins": admins,
+        "summary": {
+            "teams": len(ranking),
+            "evaluated": len([item for item in ranking if item["evaluation_count"] > 0]),
+            "pending": len([item for item in ranking if item["evaluation_count"] == 0]),
+            "jurors": juror_count,
+        },
+    }
+
+
+def validate_scores(payload: dict[str, Any]) -> tuple[dict[str, int], str | None]:
+    scores: dict[str, int] = {}
+    for rubric in RUBRIC_KEYS:
+        value = payload.get(rubric)
+        if not isinstance(value, int):
+            return {}, f"La rúbrica {rubric} debe ser un número entero entre 1 y 5."
+        if value < 1 or value > 5:
+            return {}, f"La rúbrica {rubric} debe estar entre 1 y 5."
+        scores[rubric] = value
+    return scores, None
+
+
+def store_evaluation(conn: sqlite3.Connection, team_id: int, juror_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    scores, error = validate_scores(payload)
+    if error:
+        raise ValueError(error)
+    observations = str(payload.get("observations", "")).strip()
+    if observations is None:
+        observations = ""
+    final_score_5 = round(
+        scores["problem_score"] * 0.20
+        + scores["value_score"] * 0.25
+        + scores["validation_score"] * 0.20
+        + scores["business_score"] * 0.20
+        + scores["pitch_score"] * 0.15,
+        4,
+    )
+    final_score_100 = round(final_score_5 * 20, 4)
+    timestamp = iso_now()
+    existing = conn.execute(
+        "SELECT id, created_at FROM evaluations WHERE team_id = ? AND juror_id = ?",
+        (team_id, juror_id),
+    ).fetchone()
+    if existing is None:
+        cursor = conn.execute(
+            """
+            INSERT INTO evaluations (
+                team_id, juror_id, problem_score, value_score, validation_score, business_score,
+                pitch_score, observations, final_score_5, final_score_100, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                team_id,
+                juror_id,
+                scores["problem_score"],
+                scores["value_score"],
+                scores["validation_score"],
+                scores["business_score"],
+                scores["pitch_score"],
+                observations,
+                final_score_5,
+                final_score_100,
+                timestamp,
+                timestamp,
+            ),
+        )
+        evaluation_id = cursor.lastrowid
+    else:
+        evaluation_id = existing["id"]
+        conn.execute(
+            """
+            UPDATE evaluations
+            SET problem_score = ?, value_score = ?, validation_score = ?, business_score = ?, pitch_score = ?,
+                observations = ?, final_score_5 = ?, final_score_100 = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                scores["problem_score"],
+                scores["value_score"],
+                scores["validation_score"],
+                scores["business_score"],
+                scores["pitch_score"],
+                observations,
+                final_score_5,
+                final_score_100,
+                timestamp,
+                evaluation_id,
+            ),
+        )
+    record_ranking_history(conn, evaluation_id)
+    conn.commit()
+    saved = conn.execute(
+        """
+        SELECT e.*, u.name AS juror_name, u.identifier AS juror_identifier
+        FROM evaluations e
+        INNER JOIN users u ON u.id = e.juror_id
+        WHERE e.team_id = ? AND e.juror_id = ?
+        """,
+        (team_id, juror_id),
+    ).fetchone()
+    return {
+        "id": saved["id"],
+        "team_id": saved["team_id"],
+        "juror_id": saved["juror_id"],
+        "problem_score": saved["problem_score"],
+        "value_score": saved["value_score"],
+        "validation_score": saved["validation_score"],
+        "business_score": saved["business_score"],
+        "pitch_score": saved["pitch_score"],
+        "observations": saved["observations"],
+        "final_score_5": round(float(saved["final_score_5"]), 4),
+        "final_score_100": round(float(saved["final_score_100"]), 4),
+        "created_at": saved["created_at"],
+        "updated_at": saved["updated_at"],
+        "juror_name": saved["juror_name"],
+        "juror_identifier": saved["juror_identifier"],
+    }
+
+
+class InnovatePitchHandler(SimpleHTTPRequestHandler):
+    server_version = "InnovatePitch/1.0"
+
+    def __init__(self, *args: Any, directory: str | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        super().end_headers()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/bootstrap":
+            self.handle_bootstrap()
+            return
+        if parsed.path == "/api/admin/dashboard":
+            self.handle_admin_dashboard(parsed)
+            return
+        if parsed.path.startswith("/api/admin/team/"):
+            self.handle_admin_team(parsed)
+            return
+        if parsed.path == "/api/jury/dashboard":
+            self.handle_jury_dashboard(parsed)
+            return
+        if parsed.path.startswith("/api/jury/team/"):
+            self.handle_jury_team(parsed)
+            return
+        if parsed.path == "/api/logout":
+            self.handle_logout()
+            return
+        if parsed.path in {"/", "/index.html"}:
+            self.path = "/index.html"
+        super().do_GET()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/login":
+            self.handle_login()
+            return
+        if parsed.path == "/api/logout":
+            self.handle_logout()
+            return
+        send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/jury/evaluation/"):
+            self.handle_save_evaluation(parsed)
+            return
+        send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
+
+    def handle_bootstrap(self) -> None:
+        with db_connect() as conn:
+            user = get_session_user(conn, self.headers)
+            if user is None:
+                send_json(self, {"authenticated": False, "rubrics": RUBRICS})
+                return
+            payload: dict[str, Any] = {
+                "authenticated": True,
+                "user": serialize_user(user),
+                "rubrics": RUBRICS,
+            }
+            if user["role"] == ROLE_ADMIN:
+                payload["dashboard"] = get_admin_dashboard(conn)
+            else:
+                payload["dashboard"] = get_jury_dashboard(conn, user["id"])
+            send_json(self, payload)
+
+    def handle_login(self) -> None:
+        try:
+            payload = load_json(self)
+        except Exception:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            return
+        identifier = str(payload.get("identifier", "")).strip().lower()
+        password = str(payload.get("password", ""))
+        if not identifier or not password:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Debe indicar usuario y contraseña.")
+            return
+        with db_connect() as conn:
+            user = conn.execute(
+                "SELECT * FROM users WHERE LOWER(identifier) = ? AND active = 1",
+                (identifier,),
+            ).fetchone()
+            if user is None or not verify_password(password, user["password_hash"]):
+                send_error_json(self, HTTPStatus.UNAUTHORIZED, "Credenciales inválidas.")
+                return
+            token = create_session(conn, user["id"])
+        cookie_value = f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+        if self.request_version >= "HTTP/1.1":
+            cookie_value += "; Max-Age=" + str(SESSION_TTL_HOURS * 3600)
+        send_json(
+            self,
+            {"ok": True, "user": serialize_user(user)},
+            extra_headers={"Set-Cookie": cookie_value},
+        )
+
+    def handle_logout(self) -> None:
+        cookie = parse_cookie(self.headers.get("Cookie"))
+        token = cookie.get(SESSION_COOKIE).value if cookie.get(SESSION_COOKIE) else None
+        with db_connect() as conn:
+            clear_session(conn, token)
+        expired_cookie = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        send_json(self, {"ok": True}, extra_headers={"Set-Cookie": expired_cookie})
+
+    def handle_admin_dashboard(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        params = parse_qs(parsed.query)
+        team_id = params.get("team_id", [None])[0]
+        team_id_int = int(team_id) if team_id and str(team_id).isdigit() else None
+        with db_connect() as conn:
+            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_admin_dashboard(conn, team_id_int)})
+
+    def handle_admin_team(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        team_id_text = parsed.path.rsplit("/", 1)[-1]
+        if not team_id_text.isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return
+        with db_connect() as conn:
+            detail = get_team_detail(conn, int(team_id_text))
+            if detail is None:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+                return
+            send_json(self, {"ok": True, "team": detail})
+
+    def handle_jury_dashboard(self, parsed) -> None:
+        user = require_user(self, ROLE_JURY)
+        if user is None:
+            return
+        params = parse_qs(parsed.query)
+        team_id = params.get("team_id", [None])[0]
+        team_id_int = int(team_id) if team_id and str(team_id).isdigit() else None
+        with db_connect() as conn:
+            send_json(self, {"ok": True, "user": serialize_user(user), "dashboard": get_jury_dashboard(conn, user["id"], team_id_int)})
+
+    def handle_jury_team(self, parsed) -> None:
+        user = require_user(self, ROLE_JURY)
+        if user is None:
+            return
+        team_id_text = parsed.path.rsplit("/", 1)[-1]
+        if not team_id_text.isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return
+        with db_connect() as conn:
+            detail = get_team_detail(conn, int(team_id_text))
+            if detail is None:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+                return
+            current = conn.execute(
+                "SELECT * FROM evaluations WHERE team_id = ? AND juror_id = ?",
+                (int(team_id_text), user["id"]),
+            ).fetchone()
+            evaluation = None
+            if current is not None:
+                evaluation = {
+                    "id": current["id"],
+                    "team_id": current["team_id"],
+                    "juror_id": current["juror_id"],
+                    "problem_score": current["problem_score"],
+                    "value_score": current["value_score"],
+                    "validation_score": current["validation_score"],
+                    "business_score": current["business_score"],
+                    "pitch_score": current["pitch_score"],
+                    "observations": current["observations"],
+                    "final_score_5": round(float(current["final_score_5"]), 4),
+                    "final_score_100": round(float(current["final_score_100"]), 4),
+                    "created_at": current["created_at"],
+                    "updated_at": current["updated_at"],
+                }
+            send_json(self, {"ok": True, "team": detail, "evaluation": evaluation})
+
+    def handle_save_evaluation(self, parsed) -> None:
+        user = require_user(self, ROLE_JURY)
+        if user is None:
+            return
+        team_id_text = parsed.path.rsplit("/", 1)[-1]
+        if not team_id_text.isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return
+        try:
+            payload = load_json(self)
+        except Exception:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            return
+        missing = [key for key in RUBRIC_KEYS if key not in payload]
+        if missing:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Debe completar las cinco rúbricas antes de guardar.")
+            return
+        try:
+            with db_connect() as conn:
+                team_exists = conn.execute("SELECT id FROM teams WHERE id = ?", (int(team_id_text),)).fetchone()
+                if team_exists is None:
+                    send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+                    return
+                saved = store_evaluation(conn, int(team_id_text), user["id"], payload)
+                dashboard = get_jury_dashboard(conn, user["id"], int(team_id_text))
+            send_json(self, {"ok": True, "message": "Evaluación guardada correctamente.", "evaluation": saved, "dashboard": dashboard})
+        except ValueError as exc:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, str(exc))
+        except sqlite3.IntegrityError:
+            send_error_json(self, HTTPStatus.CONFLICT, "Ya existe una evaluación para este equipo y jurado.")
+
+
+def main() -> None:
+    initialize_database()
+    server = ThreadingHTTPServer(("127.0.0.1", 8000), InnovatePitchHandler)
+    print("Innovate Pitch server running at http://127.0.0.1:8000")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
