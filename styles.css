@@ -357,6 +357,63 @@ select:focus {
   background: #eaf7ee;
 }
 
+.deliberation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.deliberation-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+  cursor: grab;
+  transition: box-shadow 0.14s ease, opacity 0.14s ease, transform 0.14s ease;
+}
+
+.deliberation-card:hover {
+  box-shadow: 0 4px 14px rgba(20, 90, 50, 0.08);
+}
+
+.deliberation-card.dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+.deliberation-card__handle {
+  color: var(--secondary, #6b8f7a);
+  font-size: 1rem;
+  letter-spacing: -2px;
+  user-select: none;
+}
+
+.deliberation-card__rank {
+  min-width: 34px;
+  font-weight: 700;
+  color: var(--primary, #1c8a4b);
+}
+
+.deliberation-card__info {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 2px;
+}
+
+.deliberation-card__controls {
+  display: flex;
+  gap: 6px;
+}
+
+.deliberation-card__controls .button {
+  padding: 4px 10px;
+  font-size: 0.95rem;
+}
+
 .badge,
 .status-pill,
 .mini-pill {

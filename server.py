@@ -137,6 +137,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             filial TEXT,
             theme_line TEXT NOT NULL,
             source_row INTEGER,
+            manual_position INTEGER,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -182,6 +183,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Migration for databases created before manual_position existed.
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(teams)").fetchall()}
+    if "manual_position" not in existing_columns:
+        conn.execute("ALTER TABLE teams ADD COLUMN manual_position INTEGER")
 
 
 def seed_users(conn: sqlite3.Connection) -> None:
@@ -367,6 +372,7 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
             "filial": team["filial"] or "",
             "theme_line": team["theme_line"],
             "source_row": team["source_row"],
+            "manual_position": team["manual_position"],
             "evaluation_count": evaluation_count,
             "average_5": round(average_5, 4),
             "average_100": round(average_100, 4),
@@ -378,10 +384,18 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         stats_by_id[team["id"]] = stats
         evaluations_by_team_serialized[team["id"]] = serialized_evaluations
 
-    ranking = sorted(
-        teams_stats,
-        key=lambda item: (-item["average_5"], -item["evaluation_count"], item["display_order"], item["name"].lower()),
-    )
+    def ranking_sort_key(item: dict[str, Any]) -> tuple:
+        has_manual = item["manual_position"] is not None
+        return (
+            0 if has_manual else 1,
+            item["manual_position"] if has_manual else 0,
+            -item["average_5"],
+            -item["evaluation_count"],
+            item["display_order"],
+            item["name"].lower(),
+        )
+
+    ranking = sorted(teams_stats, key=ranking_sort_key)
     for index, item in enumerate(ranking, start=1):
         item["position"] = index
         stats_by_id[item["id"]]["position"] = index
@@ -535,6 +549,7 @@ def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
         "filial": team["filial"],
         "theme_line": team["theme_line"],
         "source_row": team["source_row"],
+        "manual_position": team.get("manual_position"),
         "evaluation_count": team["evaluation_count"],
         "average_5": team["average_5"],
         "average_100": team["average_100"],
@@ -998,6 +1013,7 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def do_GET(self) -> None:
@@ -1039,6 +1055,9 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/admin/ranking":
+            self.handle_save_ranking(parsed)
+            return
         if parsed.path.startswith("/api/jury/evaluation/"):
             self.handle_save_evaluation(parsed)
             return
@@ -1136,6 +1155,35 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                     teams.append({"name": detail["team"]["name"], "evaluations": detail["evaluations"]})
         pdf_bytes = build_all_teams_observations_pdf(teams)
         send_pdf(self, pdf_bytes, "observaciones_todos_los_equipos.pdf")
+
+    def handle_save_ranking(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        try:
+            payload = load_json(self)
+        except Exception:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            return
+        order = payload.get("order")
+        if not isinstance(order, list) or not order:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Debe enviar el orden deliberado de los equipos.")
+            return
+        try:
+            order_ids = [int(team_id) for team_id in order]
+        except (TypeError, ValueError):
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden de equipos es inválido.")
+            return
+        with db_connect() as conn:
+            existing_ids = {row["id"] for row in conn.execute("SELECT id FROM teams").fetchall()}
+            if set(order_ids) != existing_ids or len(order_ids) != len(existing_ids):
+                send_error_json(self, HTTPStatus.BAD_REQUEST, "El orden debe incluir cada equipo exactamente una vez.")
+                return
+            for position, team_id in enumerate(order_ids, start=1):
+                conn.execute("UPDATE teams SET manual_position = ? WHERE id = ?", (position, team_id))
+            conn.commit()
+            dashboard = get_admin_dashboard(conn)
+        send_json(self, {"ok": True, "message": "Deliberación guardada. El ranking quedó fijado en el orden elegido.", "dashboard": dashboard})
 
     def handle_jury_dashboard(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)

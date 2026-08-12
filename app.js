@@ -11,6 +11,10 @@ const state = {
   loading: false,
   teamSearch: "",
   toastTimer: null,
+  deliberating: false,
+  deliberationOrder: null,
+  deliberationSaving: false,
+  confirmingDeliberation: false,
 };
 
 const dom = {
@@ -116,6 +120,101 @@ async function api(path, options = {}) {
     throw error;
   }
   return payload;
+}
+
+function startDeliberation() {
+  const ranking = state.dashboard?.ranking || [];
+  if (!ranking.length) return;
+  state.confirmingDeliberation = true;
+  render();
+}
+
+function cancelConfirmDeliberation() {
+  state.confirmingDeliberation = false;
+  render();
+}
+
+function confirmStartDeliberation() {
+  const ranking = state.dashboard?.ranking || [];
+  state.deliberationOrder = ranking
+    .slice()
+    .sort((a, b) => (a.position || 0) - (b.position || 0))
+    .map((team) => team.id);
+  state.deliberating = true;
+  state.confirmingDeliberation = false;
+  render();
+}
+
+function cancelDeliberation() {
+  state.deliberating = false;
+  state.deliberationOrder = null;
+  render();
+}
+
+function reorderDeliberation(fromIndex, toIndex) {
+  if (!state.deliberationOrder) return;
+  if (toIndex < 0 || toIndex >= state.deliberationOrder.length || fromIndex === toIndex) return;
+  const updated = [...state.deliberationOrder];
+  const [moved] = updated.splice(fromIndex, 1);
+  updated.splice(toIndex, 0, moved);
+  state.deliberationOrder = updated;
+  render();
+}
+
+async function saveDeliberation() {
+  if (!state.deliberationOrder || state.deliberationSaving) return;
+  state.deliberationSaving = true;
+  render();
+  try {
+    const response = await api('/api/admin/ranking', {
+      method: 'PUT',
+      body: JSON.stringify({ order: state.deliberationOrder }),
+    });
+    state.dashboard = response.dashboard;
+    state.deliberating = false;
+    state.deliberationOrder = null;
+    setToast(response.message || 'Deliberación guardada.');
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.deliberationSaving = false;
+    render();
+  }
+}
+
+let deliberationDragIndex = null;
+
+function handleDeliberationDragStart(event) {
+  const card = event.target.closest('.deliberation-card');
+  if (!card) return;
+  deliberationDragIndex = Number(card.dataset.deliberationIndex);
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', String(deliberationDragIndex));
+  }
+  card.classList.add('dragging');
+}
+
+function handleDeliberationDragOver(event) {
+  const card = event.target.closest('.deliberation-card');
+  if (!card || deliberationDragIndex === null) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+}
+
+function handleDeliberationDrop(event) {
+  const card = event.target.closest('.deliberation-card');
+  if (!card || deliberationDragIndex === null) return;
+  event.preventDefault();
+  const targetIndex = Number(card.dataset.deliberationIndex);
+  const fromIndex = deliberationDragIndex;
+  deliberationDragIndex = null;
+  reorderDeliberation(fromIndex, targetIndex);
+}
+
+function handleDeliberationDragEnd() {
+  deliberationDragIndex = null;
+  document.querySelectorAll('.deliberation-card.dragging').forEach((el) => el.classList.remove('dragging'));
 }
 
 async function exportAllTeamsObservationsPdf() {
@@ -240,6 +339,8 @@ function renderAdminDashboard() {
     </section>
   `;
 
+  const rankingById = new Map(ranking.map((team) => [team.id, team]));
+
   const rankingRows = ranking.length
     ? ranking.map((team) => `
         <tr class="${team.id === selectedTeam?.id ? 'active' : ''}" data-action="select-admin-team" data-team-id="${team.id}">
@@ -255,6 +356,28 @@ function renderAdminDashboard() {
         </tr>
       `).join('')
     : `<tr><td colspan="6" class="empty-state">No hay equipos cargados.</td></tr>`;
+
+  const deliberationOrder = state.deliberationOrder || [];
+  const deliberationList = deliberationOrder.length
+    ? deliberationOrder.map((teamId, index) => {
+        const team = rankingById.get(teamId);
+        if (!team) return '';
+        return `
+          <div class="deliberation-card" draggable="true" data-deliberation-index="${index}" data-team-id="${teamId}">
+            <span class="deliberation-card__handle" title="Arrastra para reordenar">⠿⠿</span>
+            <span class="deliberation-card__rank">#${index + 1}</span>
+            <div class="deliberation-card__info">
+              <strong>${escapeHtml(team.name)}</strong>
+              <span class="muted">${formatNumber(team.average_5, 2)} / 5 · ${team.evaluation_count} evaluaciones</span>
+            </div>
+            <div class="deliberation-card__controls">
+              <button type="button" class="button button--ghost" data-action="deliberation-move-up" data-deliberation-index="${index}" ${index === 0 ? 'disabled' : ''}>↑</button>
+              <button type="button" class="button button--ghost" data-action="deliberation-move-down" data-deliberation-index="${index}" ${index === deliberationOrder.length - 1 ? 'disabled' : ''}>↓</button>
+            </div>
+          </div>
+        `;
+      }).join('')
+    : '<div class="empty-state">No hay equipos cargados.</div>';
 
   const rubricAverages = selectedTeam
     ? state.rubrics.map((rubric) => `
@@ -334,6 +457,63 @@ function renderAdminDashboard() {
     `
     : '<article class="detail-card"><div class="empty-state">Seleccione un equipo de la tabla para ver su detalle.</div></article>';
 
+  const rankingHeaderActions = state.deliberating
+    ? `
+        <span class="badge">Arrastra las tarjetas para reordenar</span>
+        <div style="display:flex; gap:8px;">
+          <button class="button button--ghost" type="button" data-action="cancel-deliberation" ${state.deliberationSaving ? 'disabled' : ''}>Cancelar</button>
+          <button class="button button--primary" type="button" data-action="save-deliberation" ${state.deliberationSaving ? 'disabled' : ''}>${state.deliberationSaving ? 'Guardando...' : 'Guardar orden'}</button>
+        </div>
+      `
+    : `
+        <span class="badge">Se recalcula tras cada evaluación</span>
+        <div style="display:flex; gap:8px;">
+          <button class="button button--ghost" type="button" data-action="export-all-pdf">Exportar PDF (todos los equipos)</button>
+          <button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>
+        </div>
+      `;
+
+  const rankingBody = state.deliberating
+    ? `<div class="deliberation-list">${deliberationList}</div>`
+    : `
+        <div style="overflow:auto;">
+          <table class="ranking-table">
+            <thead>
+              <tr>
+                <th>Posición</th>
+                <th>Equipo</th>
+                <th>Puntaje / 5</th>
+                <th>Puntaje / 100</th>
+                <th>Eval.</th>
+                <th>Estado</th>
+              </tr>
+            </thead>
+            <tbody>${rankingRows}</tbody>
+          </table>
+        </div>
+      `;
+
+  const confirmDeliberationModal = state.confirmingDeliberation
+    ? `
+      <div class="modal active" aria-hidden="false">
+        <div class="modal__backdrop" data-action="cancel-confirm-deliberation"></div>
+        <div class="modal__panel card" style="width:min(420px, 100%);">
+          <div class="modal__header">
+            <div>
+              <p class="section-label">Confirmación</p>
+              <h3>¿Estás seguro que quieres deliberar?</h3>
+            </div>
+          </div>
+          <p class="muted">Recuerda que al guardar, la tabla de ranking quedará fija.</p>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
+            <button class="button button--ghost" type="button" data-action="cancel-confirm-deliberation">Cancelar</button>
+            <button class="button button--primary" type="button" data-action="confirm-start-deliberation">Sí, deliberar</button>
+          </div>
+        </div>
+      </div>
+    `
+    : '';
+
   return `
     <div class="stack">
       ${summaryCards}
@@ -342,34 +522,20 @@ function renderAdminDashboard() {
           <div class="detail-header">
             <div>
               <p class="section-label">Ranking general</p>
-              <h3>Posiciones actualizadas automáticamente</h3>
+              <h3>${state.deliberating ? 'Modo deliberación: arrastra para reordenar' : 'Posiciones actualizadas automáticamente'}</h3>
             </div>
             <div class="detail-header__actions">
-              <span class="badge">Se recalcula tras cada evaluación</span>
-              <button class="button button--ghost" type="button" data-action="export-all-pdf">Exportar PDF (Observaciones)</button>
+              ${rankingHeaderActions}
             </div>
           </div>
-          <div style="overflow:auto;">
-            <table class="ranking-table">
-              <thead>
-                <tr>
-                  <th>Posición</th>
-                  <th>Equipo</th>
-                  <th>Puntaje / 5</th>
-                  <th>Puntaje / 100</th>
-                  <th>Eval.</th>
-                  <th>Estado</th>
-                </tr>
-              </thead>
-              <tbody>${rankingRows}</tbody>
-            </table>
-          </div>
+          ${rankingBody}
         </article>
         <div class="detail-layout">
           ${teamDetail}
         </div>
       </section>
     </div>
+    ${confirmDeliberationModal}
   `;
 }
 
@@ -767,6 +933,38 @@ function handleRootClick(event) {
     return;
   }
 
+  if (action === 'start-deliberation') {
+    startDeliberation();
+    return;
+  }
+
+  if (action === 'confirm-start-deliberation') {
+    confirmStartDeliberation();
+    return;
+  }
+
+  if (action === 'cancel-confirm-deliberation') {
+    cancelConfirmDeliberation();
+    return;
+  }
+
+  if (action === 'cancel-deliberation') {
+    cancelDeliberation();
+    return;
+  }
+
+  if (action === 'save-deliberation') {
+    saveDeliberation();
+    return;
+  }
+
+  if (action === 'deliberation-move-up' || action === 'deliberation-move-down') {
+    const index = Number(actionElement.dataset.deliberationIndex);
+    const targetIndex = action === 'deliberation-move-up' ? index - 1 : index + 1;
+    reorderDeliberation(index, targetIndex);
+    return;
+  }
+
   if (action === 'jury-prev') {
     navigateTeam(-1);
     return;
@@ -839,6 +1037,10 @@ function bindEvents() {
     handleRootClick(event);
   });
   dom.dashboardRoot.addEventListener('input', handleRootInput);
+  dom.dashboardRoot.addEventListener('dragstart', handleDeliberationDragStart);
+  dom.dashboardRoot.addEventListener('dragover', handleDeliberationDragOver);
+  dom.dashboardRoot.addEventListener('drop', handleDeliberationDrop);
+  dom.dashboardRoot.addEventListener('dragend', handleDeliberationDragEnd);
   dom.logoutButton.addEventListener('click', handleLogout);
   dom.refreshButton.addEventListener('click', handleRefresh);
   dom.teamModal.addEventListener('click', handleRootClick);
