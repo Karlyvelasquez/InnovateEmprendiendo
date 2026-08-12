@@ -420,6 +420,13 @@ select:focus {
   margin-bottom: 12px;
 }
 
+.detail-header__actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
 .detail-header h3,
 .detail-header h4,
 .detail-header p {

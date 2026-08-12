@@ -118,6 +118,32 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function exportAllTeamsObservationsPdf() {
+  try {
+    const response = await fetch('/api/admin/export-pdf', {
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || 'No se pudo generar el PDF.');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : 'observaciones_todos_los_equipos.pdf';
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    setToast(error.message, 'error');
+  }
+}
+
 function rubricLabel(rubric) {
   return `${rubric.label} — ${Math.round(rubric.weight * 100)}%`;
 }
@@ -318,7 +344,10 @@ function renderAdminDashboard() {
               <p class="section-label">Ranking general</p>
               <h3>Posiciones actualizadas automáticamente</h3>
             </div>
-            <span class="badge">Se recalcula tras cada evaluación</span>
+            <div class="detail-header__actions">
+              <span class="badge">Se recalcula tras cada evaluación</span>
+              <button class="button button--ghost" type="button" data-action="export-all-pdf">Exportar PDF (Observaciones)</button>
+            </div>
           </div>
           <div style="overflow:auto;">
             <table class="ranking-table">
@@ -730,6 +759,11 @@ function handleRootClick(event) {
   if (action === 'select-admin-team') {
     const teamId = actionElement.dataset.teamId;
     if (teamId) loadDashboard(teamId);
+    return;
+  }
+
+  if (action === 'export-all-pdf') {
+    exportAllTeamsObservationsPdf();
     return;
   }
 

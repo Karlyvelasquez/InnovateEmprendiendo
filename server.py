@@ -6,6 +6,7 @@ import hmac
 import json
 import secrets
 import sqlite3
+import unicodedata
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -678,6 +679,182 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
     }
 
 
+def pdf_escape(text: str) -> bytes:
+    """Escape a string for use inside a PDF literal string, encoding with
+    cp1252 (practically identical to WinAnsiEncoding, which covers Spanish
+    accented characters) so Helvetica can render it without embedding fonts."""
+    encoded = text.encode("cp1252", errors="replace")
+    result = bytearray()
+    for byte in encoded:
+        ch = bytes([byte])
+        if ch in (b"(", b")", b"\\"):
+            result.extend(b"\\" + ch)
+        else:
+            result.extend(ch)
+    return bytes(result)
+
+
+def pdf_wrap_text(text: str, max_chars: int) -> list[str]:
+    words = text.split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if word == "":
+            continue
+        candidate = (current + " " + word).strip()
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            while len(word) > max_chars:
+                lines.append(word[:max_chars])
+                word = word[max_chars:]
+            current = word
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def build_all_teams_observations_pdf(teams: list[dict[str, Any]]) -> bytes:
+    """Build a single multi-page PDF (pure stdlib, no third-party deps) that
+    lists, for every team, only its name and each juror's observations.
+    Each team starts on its own page so the document reads as one section
+    per team."""
+    page_width, page_height = 612, 792
+    margin_left = margin_right = margin_top = margin_bottom = 56
+    usable_width = page_width - margin_left - margin_right
+
+    title_size = 18
+    heading_size = 12
+    body_size = 10.5
+    leading = 14.5
+    heading_leading = 18
+
+    body_max_chars = max(int(usable_width / (body_size * 0.5)), 20)
+
+    # Each instruction: (text, font, size, leading, force_page_break_before)
+    instructions: list[tuple[str, str, float, float, bool]] = []
+
+    for team_index, team in enumerate(teams):
+        team_name = team.get("name") or "Equipo sin nombre"
+        evaluations = team.get("evaluations") or []
+        instructions.append((team_name, "F2", title_size, title_size + 10, team_index > 0))
+        instructions.append(("Observaciones de los jurados", "F1", 11, 24, False))
+
+        if not evaluations:
+            instructions.append(("Aun no hay observaciones registradas para este equipo.", "F1", body_size, leading, False))
+        else:
+            for index, item in enumerate(evaluations):
+                juror_name = item.get("juror_name") or "Jurado"
+                observations = str(item.get("observations") or "").strip()
+                gap = heading_leading if index == 0 else heading_leading + 8
+                instructions.append((f"Jurado: {juror_name}", "F2", heading_size, gap, False))
+                if not observations:
+                    instructions.append(("(Sin observaciones)", "F1", body_size, leading, False))
+                    continue
+                for paragraph in observations.replace("\r\n", "\n").split("\n"):
+                    if paragraph.strip() == "":
+                        instructions.append(("", "F1", body_size, leading, False))
+                        continue
+                    for line in pdf_wrap_text(paragraph, body_max_chars):
+                        instructions.append((line, "F1", body_size, leading, False))
+
+    if not instructions:
+        instructions.append(("No hay equipos cargados.", "F1", body_size, leading, False))
+
+    pages: list[list[tuple[str, str, float, float]]] = []
+    current_page: list[tuple[str, str, float, float]] = []
+    y = page_height - margin_top
+    for text, font, size, entry_leading, force_break in instructions:
+        needs_break = force_break and current_page
+        fits = y - entry_leading >= margin_bottom
+        if needs_break or not fits:
+            pages.append(current_page)
+            current_page = []
+            y = page_height - margin_top
+        current_page.append((text, font, size, entry_leading))
+        y -= entry_leading
+    pages.append(current_page)
+
+    content_streams: list[bytes] = []
+    for page_entries in pages:
+        parts = [b"BT"]
+        y = page_height - margin_top
+        current_font, current_size = None, None
+        for text, font, size, entry_leading in page_entries:
+            if font != current_font or size != current_size:
+                parts.append(f"/{font} {size:.1f} Tf".encode("ascii"))
+                current_font, current_size = font, size
+            parts.append(f"1 0 0 1 {margin_left} {y:.2f} Tm".encode("ascii"))
+            parts.append(b"(" + pdf_escape(text) + b") Tj")
+            y -= entry_leading
+        parts.append(b"ET")
+        content_streams.append(b"\n".join(parts))
+
+    objects: list[bytes] = []
+
+    def add_object(body: bytes) -> int:
+        objects.append(body)
+        return len(objects)
+
+    add_object(b"")  # 1: Catalog placeholder
+    add_object(b"")  # 2: Pages placeholder
+    font_regular_num = add_object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+    font_bold_num = add_object(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+
+    page_obj_nums: list[tuple[int, int]] = []
+    for stream in content_streams:
+        content_num = add_object(b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream")
+        page_num = add_object(b"")
+        page_obj_nums.append((page_num, content_num))
+
+    kids = " ".join(f"{num} 0 R" for num, _ in page_obj_nums)
+    objects[1] = f"<< /Type /Pages /Kids [{kids}] /Count {len(page_obj_nums)} >>".encode("ascii")
+    objects[0] = b"<< /Type /Catalog /Pages 2 0 R >>"
+
+    for page_num, content_num in page_obj_nums:
+        objects[page_num - 1] = (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_width} {page_height}] "
+            f"/Resources << /Font << /F1 {font_regular_num} 0 R /F2 {font_bold_num} 0 R >> >> "
+            f"/Contents {content_num} 0 R >>"
+        ).encode("ascii")
+
+    buffer = bytearray()
+    buffer += b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+    offsets = [0] * (len(objects) + 1)
+    for idx, body in enumerate(objects, start=1):
+        offsets[idx] = len(buffer)
+        buffer += f"{idx} 0 obj\n".encode("ascii") + body + b"\nendobj\n"
+
+    xref_offset = len(buffer)
+    buffer += f"xref\n0 {len(objects) + 1}\n".encode("ascii")
+    buffer += b"0000000000 65535 f \n"
+    for idx in range(1, len(objects) + 1):
+        buffer += f"{offsets[idx]:010d} 00000 n \n".encode("ascii")
+    buffer += b"trailer\n" + f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode("ascii")
+    buffer += b"startxref\n" + f"{xref_offset}\n".encode("ascii") + b"%%EOF"
+
+    return bytes(buffer)
+
+
+def safe_pdf_filename(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    cleaned = "".join(ch if ch.isalnum() else "_" for ch in normalized)
+    cleaned = "_".join(filter(None, cleaned.split("_")))
+    return (cleaned or "equipo").strip("_")
+
+
+def send_pdf(handler: SimpleHTTPRequestHandler, data: bytes, filename: str) -> None:
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "application/pdf")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None = None) -> dict[str, Any]:
     ranking, stats_by_id, _, juror_count = compute_team_stats(conn)
     if selected_team_id is None and ranking:
@@ -831,6 +1008,9 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/admin/dashboard":
             self.handle_admin_dashboard(parsed)
             return
+        if parsed.path == "/api/admin/export-pdf":
+            self.handle_admin_export_pdf(parsed)
+            return
         if parsed.path.startswith("/api/admin/team/"):
             self.handle_admin_team(parsed)
             return
@@ -942,6 +1122,20 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                 send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
                 return
             send_json(self, {"ok": True, "team": detail})
+
+    def handle_admin_export_pdf(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        with db_connect() as conn:
+            team_rows = conn.execute("SELECT id FROM teams ORDER BY display_order ASC, id ASC").fetchall()
+            teams = []
+            for row in team_rows:
+                detail = get_team_detail(conn, row["id"])
+                if detail is not None:
+                    teams.append({"name": detail["team"]["name"], "evaluations": detail["evaluations"]})
+        pdf_bytes = build_all_teams_observations_pdf(teams)
+        send_pdf(self, pdf_bytes, "observaciones_todos_los_equipos.pdf")
 
     def handle_jury_dashboard(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
