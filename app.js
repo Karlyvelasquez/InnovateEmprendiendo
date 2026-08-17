@@ -15,6 +15,10 @@ const state = {
   deliberationOrder: null,
   deliberationSaving: false,
   confirmingDeliberation: false,
+  confirmingResetEvaluations: false,
+  resettingEvaluations: false,
+  aiImproving: false,
+  aiOriginalByTeam: {},
 };
 
 const dom = {
@@ -23,6 +27,7 @@ const dom = {
   loginForm: document.getElementById('login-form'),
   loginIdentifier: document.getElementById('login-identifier'),
   loginPassword: document.getElementById('login-password'),
+  togglePassword: document.getElementById('toggle-password'),
   loginFeedback: document.getElementById('login-feedback'),
   roleBadge: document.getElementById('auth-role-badge'),
   userName: document.getElementById('user-name'),
@@ -122,6 +127,36 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function startResetEvaluations() {
+  if (!state.user?.can_reset_evaluations) return;
+  state.confirmingResetEvaluations = true;
+  render();
+}
+
+function cancelResetEvaluations() {
+  state.confirmingResetEvaluations = false;
+  render();
+}
+
+async function confirmResetEvaluations() {
+  if (state.resettingEvaluations) return;
+  state.resettingEvaluations = true;
+  render();
+  try {
+    const response = await api('/api/admin/reset-evaluations', { method: 'DELETE' });
+    state.dashboard = response.dashboard;
+    state.confirmingResetEvaluations = false;
+    state.deliberating = false;
+    state.deliberationOrder = null;
+    setToast(response.message || 'Calificaciones reiniciadas.');
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.resettingEvaluations = false;
+    render();
+  }
+}
+
 function startDeliberation() {
   const ranking = state.dashboard?.ranking || [];
   if (!ranking.length) return;
@@ -217,6 +252,32 @@ function handleDeliberationDragEnd() {
   document.querySelectorAll('.deliberation-card.dragging').forEach((el) => el.classList.remove('dragging'));
 }
 
+async function exportWinnersExcel() {
+  try {
+    const response = await fetch('/api/admin/export-winners', {
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error || 'No se pudo generar el Excel de ganadores.');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : 'ganadores_top20.xlsx';
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    setToast(error.message, 'error');
+  }
+}
+
 async function exportAllTeamsObservationsPdf() {
   try {
     const response = await fetch('/api/admin/export-pdf', {
@@ -252,8 +313,12 @@ function teamSummaryText(team) {
   return `${team.name} · ${team.country || 'Sin país'}`;
 }
 
+function isValidScoreValue(value) {
+  return typeof value === 'number' && Number.isFinite(value) && VALID_SCORE_VALUES.includes(value);
+}
+
 function isDraftComplete(draft) {
-  const scoresOk = scoreFields.every((key) => Number.isInteger(draft?.scores?.[key]) && draft.scores[key] >= 1 && draft.scores[key] <= 5);
+  const scoresOk = scoreFields.every((key) => isValidScoreValue(draft?.scores?.[key]));
   const observationsOk = Boolean((draft?.observations || '').trim());
   return scoresOk && observationsOk;
 }
@@ -261,7 +326,7 @@ function isDraftComplete(draft) {
 function buildDraftFromEvaluation(evaluation) {
   const scores = {};
   for (const key of scoreFields) {
-    scores[key] = Number.isInteger(evaluation?.[key]) ? evaluation[key] : null;
+    scores[key] = isValidScoreValue(evaluation?.[key]) ? evaluation[key] : null;
   }
   return {
     scores,
@@ -339,11 +404,12 @@ function renderAdminDashboard() {
     </section>
   `;
 
+  const WINNER_CUTOFF = 20;
   const rankingById = new Map(ranking.map((team) => [team.id, team]));
 
   const rankingRows = ranking.length
     ? ranking.map((team) => `
-        <tr class="${team.id === selectedTeam?.id ? 'active' : ''}" data-action="select-admin-team" data-team-id="${team.id}">
+        <tr class="${team.id === selectedTeam?.id ? 'active' : ''} ${(team.position || 0) <= WINNER_CUTOFF ? 'qualifies' : ''}" data-action="select-admin-team" data-team-id="${team.id}">
           <td><strong>#${team.position || '—'}</strong></td>
           <td>
             <div><strong>${escapeHtml(team.name)}</strong></div>
@@ -362,8 +428,9 @@ function renderAdminDashboard() {
     ? deliberationOrder.map((teamId, index) => {
         const team = rankingById.get(teamId);
         if (!team) return '';
+        const qualifies = index < WINNER_CUTOFF;
         return `
-          <div class="deliberation-card" draggable="true" data-deliberation-index="${index}" data-team-id="${teamId}">
+          <div class="deliberation-card ${qualifies ? 'qualifies' : ''}" draggable="true" data-deliberation-index="${index}" data-team-id="${teamId}">
             <span class="deliberation-card__handle" title="Arrastra para reordenar">⠿⠿</span>
             <span class="deliberation-card__rank">#${index + 1}</span>
             <div class="deliberation-card__info">
@@ -467,11 +534,16 @@ function renderAdminDashboard() {
       `
     : `
         <span class="badge">Se recalcula tras cada evaluación</span>
-        <div style="display:flex; gap:8px;">
-          <button class="button button--ghost" type="button" data-action="export-all-pdf">Exportar PDF (todos los equipos)</button>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+          <button class="button button--ghost" type="button" data-action="export-winners">Exportar ganadores (Excel)</button>
           <button class="button button--secondary" type="button" data-action="start-deliberation">Deliberar</button>
+          ${state.user?.can_reset_evaluations ? '<button class="button button--danger" type="button" data-action="start-reset-evaluations">Reiniciar calificaciones</button>' : ''}
         </div>
       `;
+
+  const winnersLegend = !state.deliberating
+    ? `<div class="inline-feedback" style="margin-top:10px;"><span class="qualifies-swatch"></span> Los primeros ${WINNER_CUTOFF} lugares (resaltados) son los que clasifican.</div>`
+    : '';
 
   const rankingBody = state.deliberating
     ? `<div class="deliberation-list">${deliberationList}</div>`
@@ -491,6 +563,7 @@ function renderAdminDashboard() {
             <tbody>${rankingRows}</tbody>
           </table>
         </div>
+        ${winnersLegend}
       `;
 
   const confirmDeliberationModal = state.confirmingDeliberation
@@ -508,6 +581,27 @@ function renderAdminDashboard() {
           <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
             <button class="button button--ghost" type="button" data-action="cancel-confirm-deliberation">Cancelar</button>
             <button class="button button--primary" type="button" data-action="confirm-start-deliberation">Sí, deliberar</button>
+          </div>
+        </div>
+      </div>
+    `
+    : '';
+
+  const confirmResetModal = state.confirmingResetEvaluations
+    ? `
+      <div class="modal active" aria-hidden="false">
+        <div class="modal__backdrop" data-action="cancel-reset-evaluations"></div>
+        <div class="modal__panel card" style="width:min(440px, 100%);">
+          <div class="modal__header">
+            <div>
+              <p class="section-label">Acción irreversible</p>
+              <h3>¿Reiniciar todas las calificaciones?</h3>
+            </div>
+          </div>
+          <p class="muted">Se borrarán TODAS las evaluaciones, puntajes y observaciones de todos los jurados, y el ranking manual (deliberación) también se reiniciará. El sistema quedará como si ningún jurado hubiera votado. Esta acción no se puede deshacer.</p>
+          <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:18px;">
+            <button class="button button--ghost" type="button" data-action="cancel-reset-evaluations" ${state.resettingEvaluations ? 'disabled' : ''}>Cancelar</button>
+            <button class="button button--danger" type="button" data-action="confirm-reset-evaluations" ${state.resettingEvaluations ? 'disabled' : ''}>${state.resettingEvaluations ? 'Reiniciando...' : 'Sí, borrar todo'}</button>
           </div>
         </div>
       </div>
@@ -536,11 +630,14 @@ function renderAdminDashboard() {
       </section>
     </div>
     ${confirmDeliberationModal}
+    ${confirmResetModal}
   `;
 }
 
+const VALID_SCORE_VALUES = [1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5];
+
 function renderRatingButtons(rubricKey, currentValue) {
-  return [1, 2, 3, 4, 5].map((value) => `
+  return VALID_SCORE_VALUES.map((value) => `
     <button
       type="button"
       class="rating-button ${Number(currentValue) === value ? 'active' : ''}"
@@ -548,7 +645,7 @@ function renderRatingButtons(rubricKey, currentValue) {
       data-rubric="${rubricKey}"
       data-value="${value}"
     >
-      ${value}
+      ${value.toFixed(1)}
     </button>
   `).join('');
 }
@@ -641,26 +738,11 @@ function renderJuryDashboard() {
     : 'Lista para avanzar';
 
   const saveDisabled = !isDraftComplete(currentDraft);
-
-  const teamSelectorSummary = teams.length
-    ? teams.map((team) => `
-        <button
-          type="button"
-          class="search-item"
-          data-action="choose-team"
-          data-team-id="${team.id}"
-        >
-          <div class="search-item__top">
-            <div>
-              <h4>${escapeHtml(team.name)}</h4>
-              <small>Equipo #${team.display_order} · ${escapeHtml(team.status)}</small>
-            </div>
-            <span class="mini-pill" data-status="${escapeHtml(team.status)}">${formatNumber(team.average_5, 2)} / 5</span>
-          </div>
-          <p>${escapeHtml(getUniversityLabel(team))}</p>
-        </button>
-      `).join('')
-    : '<div class="empty-state">No hay equipos para seleccionar.</div>';
+  const aiUsed = Boolean(dashboard.ai_improvement_used);
+  const hasObservationsText = Boolean((currentDraft.observations || '').trim());
+  const aiOriginalText = dashboard.current_team_id !== undefined && dashboard.current_team_id !== null
+    ? state.aiOriginalByTeam[dashboard.current_team_id]
+    : undefined;
 
   return `
     <div class="jury-header stack">
@@ -686,6 +768,12 @@ function renderJuryDashboard() {
         <p class="section-label">Observaciones</p>
         <h3>Comentarios para el equipo <span class="required-marker">*</span></h3>
         <textarea id="jury-observations" placeholder="Escriba aquí sus observaciones (obligatorio)..." required>${escapeHtml(currentDraft.observations || '')}</textarea>
+        <div class="ai-actions">
+          ${!aiUsed
+            ? `<button type="button" class="button button--ghost" data-action="ai-improve" ${state.aiImproving || !hasObservationsText ? 'disabled' : ''}>${state.aiImproving ? 'Mejorando...' : '✨ Mejorar con IA'}</button>`
+            : `<span class="ai-used-note">✨ Ya usaste tu mejora con IA para este equipo</span>`}
+          ${aiOriginalText !== undefined ? `<button type="button" class="button button--ghost" data-action="ai-revert">↩ Volver a texto original</button>` : ''}
+        </div>
         ${currentEvaluationCard}
       </section>
 
@@ -693,16 +781,12 @@ function renderJuryDashboard() {
         <p class="section-label">Navegación</p>
         <h3>Flujo secuencial</h3>
         <div class="navigation-actions">
-          <button class="button button--ghost" type="button" data-action="jury-prev" ${dashboard.current_index <= 0 ? 'disabled' : ''}>← Equipo anterior</button>
-          <button class="button button--secondary" type="button" data-action="open-team-selector">Seleccionar equipo</button>
+          <button class="button button--danger" type="button" data-action="jury-no-show">No asistió</button>
           <button class="button button--primary" type="button" data-action="jury-save" ${saveDisabled ? 'disabled' : ''}>Guardar evaluación</button>
-          <button class="button button--ghost" type="button" data-action="jury-next" ${!teams.length || dashboard.current_index >= teams.length - 1 ? 'disabled' : ''}>Siguiente equipo →</button>
         </div>
-        <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar. Guarda antes de cambiar de equipo.' : 'La navegación principal es secuencial y el selector manual es secundario.'}</div>
+        <div class="inline-feedback">${state.juryDirty ? 'Tienes cambios sin guardar.' : 'Al guardar avanzas automáticamente al siguiente equipo pendiente. Si el equipo no se presentó, usa "No asistió" para pasarlo al final de la lista.'}</div>
       </section>
     </div>
-
-    <div class="modal-content-placeholder" hidden>${teamSelectorSummary}</div>
   `;
 }
 
@@ -848,7 +932,7 @@ async function forceLogout(showMessage = true) {
 
 async function handleSaveEvaluation() {
   if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
-  const scoresOk = scoreFields.every((key) => Number.isInteger(state.juryDraft?.scores?.[key]) && state.juryDraft.scores[key] >= 1 && state.juryDraft.scores[key] <= 5);
+  const scoresOk = scoreFields.every((key) => isValidScoreValue(state.juryDraft?.scores?.[key]));
   const observationsOk = Boolean((state.juryDraft?.observations || '').trim());
   if (!scoresOk) {
     setToast('Completa las cinco rúbricas antes de guardar.', 'error');
@@ -884,6 +968,69 @@ async function handleSaveEvaluation() {
   }
 }
 
+async function handleAiImprove() {
+  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
+  if (state.dashboard.ai_improvement_used || state.aiImproving) return;
+
+  const teamId = state.dashboard.current_team_id;
+  const text = (state.juryDraft?.observations || '').trim();
+  if (!text) {
+    setToast('Escribe una observación antes de mejorarla con IA.', 'error');
+    return;
+  }
+
+  state.aiImproving = true;
+  render();
+  try {
+    const response = await api(`/api/jury/team/${teamId}/improve-observations`, {
+      method: 'POST',
+      body: JSON.stringify({ texto_original: text }),
+    });
+    state.aiOriginalByTeam[teamId] = text;
+    state.juryDraft.observations = response.improved_text;
+    state.juryDirty = true;
+    state.dashboard.ai_improvement_used = true;
+    setToast('Observación mejorada con IA. Puedes editarla o volver al texto original.');
+  } catch (error) {
+    setToast(error.message, 'error');
+  } finally {
+    state.aiImproving = false;
+    render();
+  }
+}
+
+function handleAiRevert() {
+  const teamId = state.dashboard?.current_team_id;
+  if (teamId === undefined || teamId === null) return;
+  const original = state.aiOriginalByTeam[teamId];
+  if (original === undefined) return;
+  state.juryDraft.observations = original;
+  state.juryDirty = true;
+  delete state.aiOriginalByTeam[teamId];
+  render();
+}
+
+async function handleJuryNoShow() {
+  if (state.role !== 'jury' || !state.dashboard?.current_team_id) return;
+  if (!confirmDiscardChanges()) return;
+
+  const teamId = state.dashboard.current_team_id;
+  try {
+    const response = await api(`/api/jury/team/${teamId}/no-show`, {
+      method: 'POST',
+      body: '{}',
+    });
+    state.dashboard = response.dashboard;
+    state.juryDraft = buildDraftFromEvaluation(response.dashboard.current_evaluation);
+    state.juryDirty = false;
+    state.activeTeamId = response.dashboard.current_team_id;
+    render();
+    setToast(response.message || "Equipo marcado como 'No asistió'.");
+  } catch (error) {
+    setToast(error.message, 'error');
+  }
+}
+
 async function navigateTeam(offsetOrId) {
   if (state.role !== 'jury') return;
   if (!confirmDiscardChanges()) return;
@@ -910,7 +1057,7 @@ async function handleRating(event) {
   event.preventDefault();
   const rubricKey = button.dataset.rubric;
   const value = Number(button.dataset.value);
-  if (!scoreFields.includes(rubricKey) || !Number.isInteger(value)) return;
+  if (!scoreFields.includes(rubricKey) || !VALID_SCORE_VALUES.includes(value)) return;
   state.juryDraft = state.juryDraft || buildDraftFromEvaluation(null);
   state.juryDraft.scores[rubricKey] = value;
   state.juryDirty = true;
@@ -933,6 +1080,11 @@ function handleRootClick(event) {
     return;
   }
 
+  if (action === 'export-winners') {
+    exportWinnersExcel();
+    return;
+  }
+
   if (action === 'start-deliberation') {
     startDeliberation();
     return;
@@ -945,6 +1097,21 @@ function handleRootClick(event) {
 
   if (action === 'cancel-confirm-deliberation') {
     cancelConfirmDeliberation();
+    return;
+  }
+
+  if (action === 'start-reset-evaluations') {
+    startResetEvaluations();
+    return;
+  }
+
+  if (action === 'cancel-reset-evaluations') {
+    cancelResetEvaluations();
+    return;
+  }
+
+  if (action === 'confirm-reset-evaluations') {
+    confirmResetEvaluations();
     return;
   }
 
@@ -965,13 +1132,18 @@ function handleRootClick(event) {
     return;
   }
 
-  if (action === 'jury-prev') {
-    navigateTeam(-1);
+  if (action === 'jury-no-show') {
+    handleJuryNoShow();
     return;
   }
 
-  if (action === 'jury-next') {
-    navigateTeam(1);
+  if (action === 'ai-improve') {
+    handleAiImprove();
+    return;
+  }
+
+  if (action === 'ai-revert') {
+    handleAiRevert();
     return;
   }
 
@@ -1009,6 +1181,10 @@ function handleRootInput(event) {
     if (saveButton) {
       saveButton.disabled = !isDraftComplete(state.juryDraft);
     }
+    const aiButton = document.querySelector('[data-action="ai-improve"]');
+    if (aiButton) {
+      aiButton.disabled = state.aiImproving || !target.value.trim();
+    }
     return;
   }
 
@@ -1027,11 +1203,18 @@ async function handleRefresh() {
 
 async function handleLogout() {
   await forceLogout(true);
-  setLoginFeedback('Credenciales demo: admin@innovate.pitch / admin123');
+  setLoginFeedback('');
 }
 
 function bindEvents() {
   dom.loginForm.addEventListener('submit', handleLogin);
+  dom.togglePassword.addEventListener('click', () => {
+    const isHidden = dom.loginPassword.type === 'password';
+    dom.loginPassword.type = isHidden ? 'text' : 'password';
+    dom.togglePassword.textContent = isHidden ? '🙈' : '👁';
+    dom.togglePassword.setAttribute('aria-pressed', String(isHidden));
+    dom.togglePassword.setAttribute('aria-label', isHidden ? 'Ocultar contraseña' : 'Mostrar contraseña');
+  });
   dom.dashboardRoot.addEventListener('click', (event) => {
     handleRating(event);
     handleRootClick(event);

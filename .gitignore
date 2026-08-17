@@ -1,0 +1,16 @@
+# Credenciales y configuración sensible - NUNCA subir esto
+users_seed.json
+.env
+
+# Base de datos local (contiene evaluaciones, observaciones, etc.)
+innovate_pitch.db
+innovate_pitch.db-shm
+innovate_pitch.db-wal
+
+# Python
+__pycache__/
+*.pyc
+
+# Sistema
+.DS_Store
+Thumbs.db

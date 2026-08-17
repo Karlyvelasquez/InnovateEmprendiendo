@@ -26,9 +26,13 @@ body {
   color: var(--text);
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   background:
-    radial-gradient(circle at top left, rgba(17, 122, 67, 0.14), transparent 34%),
-    radial-gradient(circle at 90% 10%, rgba(244, 181, 63, 0.14), transparent 28%),
-    linear-gradient(180deg, #fbfefb 0%, #eff8f2 100%);
+    linear-gradient(180deg, rgba(9, 22, 16, 0.55), rgba(9, 22, 16, 0.62)),
+    url('fondo.png');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  min-height: 100vh;
 }
 
 body::before {
@@ -61,16 +65,31 @@ textarea {
   padding: 24px 26px;
   margin-bottom: 18px;
   color: white;
-  border: 1px solid rgba(255, 255, 255, 0.26);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 28px;
-  background: linear-gradient(135deg, #0f8a49 0%, #0b5b33 70%, #173327 100%);
-  box-shadow: 0 24px 56px rgba(12, 97, 52, 0.24);
+  background: linear-gradient(100deg, rgba(255, 255, 255, 0.5) 0%, rgba(238, 249, 239, 0.42) 8%, rgba(76, 175, 99, 0.5) 24%, rgba(47, 158, 121, 0.5) 45%, rgba(31, 143, 163, 0.5) 65%, rgba(28, 127, 196, 0.5) 85%, rgba(21, 101, 192, 0.5) 100%);
+  backdrop-filter: blur(2px);
+  box-shadow: 0 24px 56px rgba(0, 0, 0, 0.28);
 }
 
 .hero h1,
 .hero-copy,
 .eyebrow {
   margin: 0;
+}
+
+.hero__brand {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+.hero__logo {
+  height: 56px;
+  width: auto;
+  max-width: 160px;
+  object-fit: contain;
+  flex-shrink: 0;
 }
 
 .eyebrow {
@@ -99,7 +118,7 @@ textarea {
   border-radius: 18px;
   color: #effaf3;
   background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: none;
   backdrop-filter: blur(10px);
   text-align: right;
   font-weight: 700;
@@ -111,6 +130,10 @@ textarea {
 
 .screen.active {
   display: block;
+}
+
+#auth-screen.active {
+  padding: 48px 20px;
 }
 
 .card {
@@ -128,6 +151,11 @@ textarea {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
   gap: 18px;
+}
+
+.auth-grid--single {
+  grid-template-columns: minmax(0, 480px);
+  justify-content: center;
 }
 
 .section-label {
@@ -159,6 +187,44 @@ textarea {
   display: grid;
   gap: 6px;
   font-weight: 600;
+}
+
+.password-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.password-field input {
+  padding-right: 44px;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 6px 8px;
+  border-radius: 10px;
+  color: var(--secondary, #6b8f7a);
+  opacity: 0.75;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.password-toggle:hover {
+  opacity: 1;
+  background: rgba(17, 122, 67, 0.08);
+}
+
+.password-toggle:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: 0 0 0 3px rgba(17, 122, 67, 0.18);
 }
 
 input,
@@ -357,6 +423,35 @@ select:focus {
   background: #eaf7ee;
 }
 
+.ranking-table tbody tr.qualifies {
+  background: #fff9e6;
+  box-shadow: inset 3px 0 0 #d4a017;
+}
+
+.ranking-table tbody tr.qualifies:hover {
+  background: #fff5d6;
+}
+
+.ranking-table tbody tr.qualifies.active {
+  background: #fdeeb8;
+}
+
+.deliberation-card.qualifies {
+  background: #fff9e6;
+  box-shadow: inset 3px 0 0 #d4a017;
+}
+
+.qualifies-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: #fff9e6;
+  box-shadow: inset 3px 0 0 #d4a017;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
 .deliberation-list {
   display: flex;
   flex-direction: column;
@@ -455,6 +550,12 @@ select:focus {
 .mini-pill[data-status="Evaluado"] {
   background: #eaf7ee;
   color: var(--primary-strong);
+}
+
+.status-pill[data-status="No asistió"],
+.mini-pill[data-status="No asistió"] {
+  background: #fbe7e7;
+  color: #a13a3a;
 }
 
 .detail-layout {
@@ -786,6 +887,20 @@ select:focus {
   margin-top: 12px;
 }
 
+.ai-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.ai-used-note {
+  font-size: 0.85rem;
+  color: var(--secondary, #6b8f7a);
+  font-style: italic;
+}
+
 .navigation-card {
   display: grid;
   gap: 12px;
@@ -950,6 +1065,10 @@ select:focus {
 
   .hero {
     flex-direction: column;
+  }
+
+  .hero__logo {
+    height: 44px;
   }
 
   .hero__badge {

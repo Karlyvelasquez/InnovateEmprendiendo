@@ -4,59 +4,39 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Innovate Pitch | Evaluación de Pitch</title>
+    <link rel="icon" type="image/png" href="EPM-logo-transparent.png" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <div class="shell">
       <header class="hero">
-        <div>
-          <p class="eyebrow">EPM · Innovate Pitch</p>
-          <h1>Evaluación de pitch con autenticación y ranking</h1>
-          <p class="hero-copy">Acceso por rol, evaluación secuencial para jurados, ranking automático y trazabilidad completa en SQLite.</p>
+        <div class="hero__brand">
+          <img src="EPM-logo-transparent.png" alt="Logo EPM" class="hero__logo" />
+          <h1>IINNOVATE EMPRENDIENDO - 2026</h1>
         </div>
         <div class="hero__badge" id="auth-role-badge">Sesión no iniciada</div>
       </header>
 
       <section id="auth-screen" class="screen active">
-        <div class="auth-grid">
+        <div class="auth-grid auth-grid--single">
           <div class="card card--highlight">
             <p class="section-label">Acceso</p>
             <h2>Inicia sesión para continuar</h2>
-            <p class="muted">La plataforma distingue administradores y jurados desde el backend. Los datos de equipos se cargan desde <strong>Programación_I_pitch_con_descripcion.xlsx</strong>.</p>
             <form id="login-form" class="login-form">
               <label>
                 Usuario o correo
-                <input id="login-identifier" name="identifier" type="text" placeholder="admin@innovate.pitch" autocomplete="username" required />
+                <input id="login-identifier" name="identifier" type="text" placeholder="correo@epm.com.co" autocomplete="username" required />
               </label>
               <label>
                 Contraseña
-                <input id="login-password" name="password" type="password" placeholder="••••••••" autocomplete="current-password" required />
+                <div class="password-field">
+                  <input id="login-password" name="password" type="password" placeholder="••••••••" autocomplete="current-password" required />
+                  <button type="button" id="toggle-password" class="password-toggle" aria-label="Mostrar contraseña" aria-pressed="false">👁</button>
+                </div>
               </label>
               <button class="button button--primary" type="submit">Entrar</button>
             </form>
-            <div class="auth-note" id="login-feedback">Credenciales demo: admin@innovate.pitch / admin123</div>
-          </div>
-
-          <div class="card info-card">
-            <p class="section-label">Cuenta demo</p>
-            <div class="demo-accounts">
-              <div class="demo-account">
-                <strong>Administrador</strong>
-                <span>admin@innovate.pitch</span>
-                <span>admin123</span>
-              </div>
-              <div class="demo-account">
-                <strong>Jurados</strong>
-                <span>juan.perez@innovate.pitch</span>
-                <span>jurado123</span>
-              </div>
-              <div class="demo-account">
-                <strong>Más perfiles</strong>
-                <span>ana.garcia@innovate.pitch</span>
-                <span>carlos.rojas@innovate.pitch</span>
-                <span>laura.gomez@innovate.pitch</span>
-              </div>
-            </div>
+            <div class="auth-note" id="login-feedback"></div>
           </div>
         </div>
       </section>

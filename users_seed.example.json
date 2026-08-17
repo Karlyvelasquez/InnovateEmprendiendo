@@ -1,0 +1,4 @@
+[
+  {"name": "Nombre Apellido", "identifier": "correo@ejemplo.com", "password": "ContraseñaSegura.123", "role": "admin"},
+  {"name": "Nombre Apellido", "identifier": "otro.correo@ejemplo.com", "password": "OtraContraseña.456", "role": "jury"}
+]

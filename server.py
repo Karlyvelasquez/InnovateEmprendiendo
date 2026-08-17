@@ -3,11 +3,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
+import os
 import secrets
 import sqlite3
+import time
 import unicodedata
 import zipfile
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -18,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "innovate_pitch.db"
@@ -28,14 +34,42 @@ PBKDF2_ITERATIONS = 210_000
 
 ROLE_ADMIN = "admin"
 ROLE_JURY = "jury"
+WINNERS_COUNT = 20
+SUPER_ADMIN_IDENTIFIER = "karly.velasquez@epm.com.co"
 
-SEED_USERS = [
-    {"name": "Administradora EPM", "identifier": "admin@innovate.pitch", "password": "admin123", "role": ROLE_ADMIN},
-    {"name": "Juan Pérez", "identifier": "juan.perez@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
-    {"name": "Ana García", "identifier": "ana.garcia@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
-    {"name": "Carlos Rojas", "identifier": "carlos.rojas@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
-    {"name": "Laura Gómez", "identifier": "laura.gomez@innovate.pitch", "password": "jurado123", "role": ROLE_JURY},
-]
+def load_seed_users() -> list[dict[str, str]]:
+    """Load the admin/jury account list from users_seed.json, which sits
+    next to this script but is NOT meant to be committed to git (it's in
+    .gitignore). See users_seed.example.json for the expected format."""
+    seed_path = ROOT / "users_seed.json"
+    if not seed_path.exists():
+        print(
+            "ADVERTENCIA: no se encontró users_seed.json junto a server.py. "
+            "No se sembrará ningún usuario. Copia users_seed.example.json a "
+            "users_seed.json y complétalo con los datos reales."
+        )
+        return []
+    try:
+        raw = json.loads(seed_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"users_seed.json tiene un error de formato JSON: {exc}") from exc
+    users: list[dict[str, str]] = []
+    for index, item in enumerate(raw):
+        try:
+            users.append(
+                {
+                    "name": item["name"],
+                    "identifier": item["identifier"],
+                    "password": item["password"],
+                    "role": item["role"],
+                }
+            )
+        except KeyError as exc:
+            raise SystemExit(f"users_seed.json: falta el campo {exc} en la entrada #{index + 1}.") from exc
+    return users
+
+
+SEED_USERS = load_seed_users()
 
 RUBRICS = [
     {
@@ -145,11 +179,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             team_id INTEGER NOT NULL,
             juror_id INTEGER NOT NULL,
-            problem_score INTEGER NOT NULL,
-            value_score INTEGER NOT NULL,
-            validation_score INTEGER NOT NULL,
-            business_score INTEGER NOT NULL,
-            pitch_score INTEGER NOT NULL,
+            problem_score REAL NOT NULL,
+            value_score REAL NOT NULL,
+            validation_score REAL NOT NULL,
+            business_score REAL NOT NULL,
+            pitch_score REAL NOT NULL,
             observations TEXT NOT NULL DEFAULT '',
             final_score_5 REAL NOT NULL,
             final_score_100 REAL NOT NULL,
@@ -172,6 +206,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(evaluation_id) REFERENCES evaluations(id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS no_shows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            juror_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(team_id, juror_id),
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
+            FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_improvements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            juror_id INTEGER NOT NULL,
+            used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(team_id, juror_id),
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE,
+            FOREIGN KEY(juror_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             token TEXT NOT NULL UNIQUE,
@@ -190,17 +244,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def seed_users(conn: sqlite3.Connection) -> None:
-    existing = {
-        row["identifier"]
-        for row in conn.execute("SELECT identifier FROM users")
-    }
+    desired_identifiers = {user["identifier"].lower() for user in SEED_USERS}
+    for row in conn.execute("SELECT id, identifier FROM users").fetchall():
+        if row["identifier"].lower() not in desired_identifiers:
+            conn.execute("DELETE FROM users WHERE id = ?", (row["id"],))
     for user in SEED_USERS:
-        if user["identifier"] in existing:
-            continue
-        conn.execute(
-            "INSERT INTO users (name, identifier, password_hash, role, active) VALUES (?, ?, ?, ?, 1)",
-            (user["name"], user["identifier"], pbkdf2_hash(user["password"]), user["role"]),
-        )
+        password_hash = pbkdf2_hash(user["password"])
+        existing = conn.execute(
+            "SELECT id FROM users WHERE LOWER(identifier) = ?",
+            (user["identifier"].lower(),),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO users (name, identifier, password_hash, role, active) VALUES (?, ?, ?, ?, 1)",
+                (user["name"], user["identifier"], password_hash, user["role"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET name = ?, identifier = ?, password_hash = ?, role = ?, active = 1 WHERE id = ?",
+                (user["name"], user["identifier"], password_hash, user["role"], existing["id"]),
+            )
 
 
 def shared_strings_from_xlsx(zip_file: zipfile.ZipFile) -> list[str]:
@@ -315,6 +378,9 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         """
     ).fetchall()
 
+    no_show_rows = conn.execute("SELECT team_id, COUNT(*) AS cnt FROM no_shows GROUP BY team_id").fetchall()
+    no_show_counts: dict[int, int] = {row["team_id"]: row["cnt"] for row in no_show_rows}
+
     evaluations_by_team: dict[int, list[sqlite3.Row]] = defaultdict(list)
     for row in eval_rows:
         evaluations_by_team[row["team_id"]].append(row)
@@ -334,7 +400,10 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
         average_5 = average(final_5_values)
         average_100 = average(final_100_values)
         evaluation_count = len(team_evaluations)
-        if evaluation_count == 0:
+        no_show_count = no_show_counts.get(team["id"], 0)
+        if evaluation_count == 0 and jurors and no_show_count >= len(jurors):
+            status = "No asistió"
+        elif evaluation_count == 0:
             status = "Pendiente"
         elif evaluation_count < len(jurors):
             status = "En progreso"
@@ -374,6 +443,7 @@ def compute_team_stats(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], 
             "source_row": team["source_row"],
             "manual_position": team["manual_position"],
             "evaluation_count": evaluation_count,
+            "no_show_count": no_show_count,
             "average_5": round(average_5, 4),
             "average_100": round(average_100, 4),
             "rubric_averages": {key: round(value, 4) for key, value in rubric_averages.items()},
@@ -534,6 +604,7 @@ def serialize_user(user: sqlite3.Row) -> dict[str, Any]:
         "role": user["role"],
         "active": bool(user["active"]),
         "created_at": user["created_at"],
+        "can_reset_evaluations": user["identifier"].lower() == SUPER_ADMIN_IDENTIFIER.lower(),
     }
 
 
@@ -551,6 +622,7 @@ def serialize_team(team: dict[str, Any]) -> dict[str, Any]:
         "source_row": team["source_row"],
         "manual_position": team.get("manual_position"),
         "evaluation_count": team["evaluation_count"],
+        "no_show_count": team.get("no_show_count", 0),
         "average_5": team["average_5"],
         "average_100": team["average_100"],
         "rubric_averages": team["rubric_averages"],
@@ -605,31 +677,136 @@ def get_evaluated_team_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
     return {row["team_id"] for row in rows}
 
 
+def get_juror_no_show_ids(conn: sqlite3.Connection, juror_id: int) -> set[int]:
+    rows = conn.execute("SELECT team_id FROM no_shows WHERE juror_id = ?", (juror_id,)).fetchall()
+    return {row["team_id"] for row in rows}
+
+
+GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_SYSTEM_INSTRUCTION = (
+    "Eres un asistente de edición para jurados de proyectos. Tu única tarea es corregir la "
+    "ortografía, mejorar la gramática y dar un tono profesional y constructivo al texto "
+    "proporcionado.\n"
+    "REGLAS ESTRICTAS:\n"
+    "- Conserva exactamente la misma intención, aspectos positivos y críticas del texto original.\n"
+    "- NO agregues información, elogios ni críticas que el usuario no haya escrito.\n"
+    "- Sé breve y directo (máximo 2 a 3 oraciones).\n"
+    "- Devuelve ÚNICAMENTE el texto mejorado en texto plano, sin introducciones ni comillas."
+)
+
+
+def _call_gemini_once(api_key: str, original_text: str) -> str:
+    """One attempt at the Gemini call. Raises _GeminiRetryable for transient
+    errors (429/503) so the caller can retry, or ValueError for anything
+    else that shouldn't be retried."""
+    body = json.dumps(
+        {
+            "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_INSTRUCTION}]},
+            "contents": [{"parts": [{"text": original_text}]}],
+            "generationConfig": {"temperature": 0.3},
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GEMINI_API_URL}?key={api_key}",
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        print(f"[Gemini API error] HTTP {exc.code} calling model '{GEMINI_MODEL}': {detail}")
+        if exc.code == 404:
+            raise ValueError(
+                f"La IA no pudo procesar el texto (error 404: el modelo '{GEMINI_MODEL}' no está "
+                "disponible). Es posible que Google haya retirado este modelo; revisa GEMINI_MODEL "
+                "en server.py."
+            ) from exc
+        if exc.code in (429, 503):
+            raise _GeminiRetryable(exc.code) from exc
+        raise ValueError(f"La IA no pudo procesar el texto (error {exc.code}). Intenta de nuevo.") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError("No se pudo conectar con el servicio de IA. Intenta de nuevo.") from exc
+    except (TimeoutError, OSError) as exc:
+        raise ValueError("El servicio de IA tardó demasiado en responder. Intenta de nuevo.") from exc
+
+    try:
+        candidates = payload.get("candidates") or []
+        parts = candidates[0]["content"]["parts"]
+        improved = "".join(part.get("text", "") for part in parts).strip()
+    except (KeyError, IndexError, TypeError):
+        improved = ""
+
+    if not improved:
+        raise ValueError("La IA no devolvió ningún texto. Intenta de nuevo.")
+    return improved
+
+
+class _GeminiRetryable(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"Gemini transient error {status_code}")
+        self.status_code = status_code
+
+
+def improve_text_with_gemini(original_text: str) -> str:
+    """Send the juror's observation text to Gemini for a light grammar/tone
+    pass. Retries automatically (short backoff) on transient 429/503
+    "overloaded" responses, which are common on the free tier. Raises
+    ValueError with a user-facing message on any non-recoverable failure."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("La mejora con IA no está configurada en el servidor (falta GEMINI_API_KEY).")
+
+    delays = [1, 2]  # seconds between attempts (2 retries after the first try)
+    last_status = None
+    for attempt, delay in enumerate([0] + delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _call_gemini_once(api_key, original_text)
+        except _GeminiRetryable as exc:
+            last_status = exc.status_code
+            continue
+
+    raise ValueError(
+        f"La IA está saturada en este momento (error {last_status}). Espera unos segundos e intenta de nuevo."
+    )
+
+
 def get_next_pending_team_id(
     conn: sqlite3.Connection,
     juror_id: int,
     team_rows: list[sqlite3.Row],
     after_team_id: int | None = None,
 ) -> int | None:
-    """Return the first team (in display order) the juror hasn't evaluated yet.
+    """Return the next team (in display order) this juror should evaluate.
 
-    If ``after_team_id`` is given, search starts right after that team and wraps
-    around the full list. If every team is already evaluated, falls back to
-    ``after_team_id`` (or the first team) so there's always something to show.
-    """
+    Teams the juror has already evaluated are always skipped. Teams this
+    juror personally marked as 'No asistió' are deprioritized: skipped on
+    the first pass, but if nothing else is left to evaluate, they resurface
+    (so the juror still gets to them eventually, just last)."""
     if not team_rows:
         return None
     evaluated_ids = get_evaluated_team_ids(conn, juror_id)
+    deprioritized_ids = get_juror_no_show_ids(conn, juror_id) - evaluated_ids
     ids = [row["id"] for row in team_rows]
     start_index = 0
     if after_team_id is not None and after_team_id in ids:
         start_index = ids.index(after_team_id) + 1
-    for idx in range(start_index, len(ids)):
-        if ids[idx] not in evaluated_ids:
-            return ids[idx]
-    for idx in range(0, start_index):
-        if ids[idx] not in evaluated_ids:
-            return ids[idx]
+    ordered_indices = list(range(start_index, len(ids))) + list(range(0, start_index))
+
+    for idx in ordered_indices:
+        candidate = ids[idx]
+        if candidate not in evaluated_ids and candidate not in deprioritized_ids:
+            return candidate
+    for idx in ordered_indices:
+        candidate = ids[idx]
+        if candidate not in evaluated_ids:
+            return candidate
     return after_team_id if after_team_id is not None else ids[0]
 
 
@@ -676,6 +853,13 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
             if row["id"] == team_id:
                 current_index = index
                 break
+    ai_improvement_used = False
+    if team_id is not None:
+        ai_row = conn.execute(
+            "SELECT 1 FROM ai_improvements WHERE team_id = ? AND juror_id = ?",
+            (team_id, juror_id),
+        ).fetchone()
+        ai_improvement_used = ai_row is not None
     return {
         "teams": team_summary,
         "current_team_id": team_id,
@@ -683,6 +867,7 @@ def get_jury_dashboard(conn: sqlite3.Connection, juror_id: int, team_id: int | N
         "current_team": team_detail["team"] if team_detail else None,
         "current_team_detail": team_detail,
         "current_evaluation": current_eval,
+        "ai_improvement_used": ai_improvement_used,
         "progress": {
             "assigned": len(team_rows),
             "completed": completed_count,
@@ -860,6 +1045,133 @@ def safe_pdf_filename(name: str) -> str:
     return (cleaned or "equipo").strip("_")
 
 
+def xlsx_col_letter(idx: int) -> str:
+    letters = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def build_xlsx(headers: list[str], rows: list[list[Any]], sheet_name: str = "Hoja1") -> bytes:
+    """Build a minimal but valid .xlsx workbook using only the standard
+    library (zipfile + hand-written XML), matching this project's existing
+    no-third-party-dependencies approach."""
+    sheet_name = (sheet_name or "Hoja1")[:31]
+
+    def cell_xml(col_idx: int, row_idx: int, value: Any, is_header: bool) -> str:
+        ref = f"{xlsx_col_letter(col_idx)}{row_idx}"
+        style_attr = ' s="1"' if is_header else ""
+        if isinstance(value, bool):
+            value = str(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+        text = "" if value is None else str(value)
+        text = xml_escape(text)
+        return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+    row_parts = []
+    row_idx = 1
+    header_cells = "".join(cell_xml(i + 1, row_idx, h, True) for i, h in enumerate(headers))
+    row_parts.append(f'<row r="{row_idx}">{header_cells}</row>')
+    for row in rows:
+        row_idx += 1
+        cells = "".join(cell_xml(i + 1, row_idx, v, False) for i, v in enumerate(row))
+        row_parts.append(f'<row r="{row_idx}">{cells}</row>')
+    sheet_data = "".join(row_parts)
+
+    col_widths = "".join(
+        f'<col min="{i + 1}" max="{i + 1}" width="26" customWidth="1"/>' for i in range(len(headers))
+    )
+
+    sheet1_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<cols>{col_widths}</cols>'
+        f'<sheetData>{sheet_data}</sheetData>'
+        '</worksheet>'
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '</Types>'
+    )
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{xml_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    workbook_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '</Relationships>'
+    )
+
+    styles_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2">'
+        '<font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+        '</fonts>'
+        '<fills count="3">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF117A43"/><bgColor indexed="64"/></patternFill></fill>'
+        '</fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", styles_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet1_xml)
+    return buffer.getvalue()
+
+
+def send_xlsx(handler: SimpleHTTPRequestHandler, data: bytes, filename: str) -> None:
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 def send_pdf(handler: SimpleHTTPRequestHandler, data: bytes, filename: str) -> None:
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "application/pdf")
@@ -891,15 +1203,18 @@ def get_admin_dashboard(conn: sqlite3.Connection, selected_team_id: int | None =
     }
 
 
-def validate_scores(payload: dict[str, Any]) -> tuple[dict[str, int], str | None]:
-    scores: dict[str, int] = {}
+def validate_scores(payload: dict[str, Any]) -> tuple[dict[str, float], str | None]:
+    scores: dict[str, float] = {}
     for rubric in RUBRIC_KEYS:
         value = payload.get(rubric)
-        if not isinstance(value, int):
-            return {}, f"La rúbrica {rubric} debe ser un número entero entre 1 y 5."
-        if value < 1 or value > 5:
-            return {}, f"La rúbrica {rubric} debe estar entre 1 y 5."
-        scores[rubric] = value
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return {}, f"La rúbrica {rubric} debe ser un número entre 1.0 y 5.0 en pasos de 0.5."
+        value = float(value)
+        doubled = value * 2
+        rounded_doubled = round(doubled)
+        if abs(doubled - rounded_doubled) > 1e-6 or rounded_doubled < 2 or rounded_doubled > 10:
+            return {}, f"La rúbrica {rubric} debe ser un valor entre 1.0 y 5.0 en pasos de 0.5 (1.0, 1.5, 2.0 ... 5.0)."
+        scores[rubric] = rounded_doubled / 2
     return scores, None
 
 
@@ -1027,6 +1342,9 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/admin/export-pdf":
             self.handle_admin_export_pdf(parsed)
             return
+        if parsed.path == "/api/admin/export-winners":
+            self.handle_admin_export_winners(parsed)
+            return
         if parsed.path.startswith("/api/admin/team/"):
             self.handle_admin_team(parsed)
             return
@@ -1051,6 +1369,12 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/logout":
             self.handle_logout()
             return
+        if parsed.path.startswith("/api/jury/team/") and parsed.path.rstrip("/").endswith("/no-show"):
+            self.handle_jury_no_show(parsed)
+            return
+        if parsed.path.startswith("/api/jury/team/") and parsed.path.rstrip("/").endswith("/improve-observations"):
+            self.handle_jury_improve_observations(parsed)
+            return
         send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
 
     def do_PUT(self) -> None:
@@ -1060,6 +1384,13 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/jury/evaluation/"):
             self.handle_save_evaluation(parsed)
+            return
+        send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/admin/reset-evaluations":
+            self.handle_reset_evaluations()
             return
         send_error_json(self, HTTPStatus.NOT_FOUND, "Ruta no encontrada.")
 
@@ -1156,6 +1487,55 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
         pdf_bytes = build_all_teams_observations_pdf(teams)
         send_pdf(self, pdf_bytes, "observaciones_todos_los_equipos.pdf")
 
+    def handle_admin_export_winners(self, parsed) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        with db_connect() as conn:
+            ranking, _, _, _ = compute_team_stats(conn)
+
+        top_teams = ranking[:WINNERS_COUNT]
+        headers = [
+            "Posición",
+            "Equipo",
+            "Puntaje Final Equipo /5",
+            "Puntaje Final Equipo /100",
+            "Jurado",
+            "Puntaje del Jurado /5",
+            "Observaciones del Jurado",
+        ]
+        rows: list[list[Any]] = []
+        for team in top_teams:
+            evaluations = team.get("evaluations") or []
+            if not evaluations:
+                rows.append(
+                    [
+                        team["position"],
+                        team["name"],
+                        team["average_5"],
+                        team["average_100"],
+                        "",
+                        "",
+                        "Sin evaluaciones registradas",
+                    ]
+                )
+                continue
+            for evaluation in evaluations:
+                rows.append(
+                    [
+                        team["position"],
+                        team["name"],
+                        team["average_5"],
+                        team["average_100"],
+                        evaluation.get("juror_name") or "",
+                        evaluation.get("final_score_5"),
+                        evaluation.get("observations") or "",
+                    ]
+                )
+
+        xlsx_bytes = build_xlsx(headers, rows, sheet_name=f"Ganadores Top {WINNERS_COUNT}")
+        send_xlsx(self, xlsx_bytes, f"ganadores_top{WINNERS_COUNT}.xlsx")
+
     def handle_save_ranking(self, parsed) -> None:
         user = require_user(self, ROLE_ADMIN)
         if user is None:
@@ -1184,6 +1564,36 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             conn.commit()
             dashboard = get_admin_dashboard(conn)
         send_json(self, {"ok": True, "message": "Deliberación guardada. El ranking quedó fijado en el orden elegido.", "dashboard": dashboard})
+
+    def handle_reset_evaluations(self) -> None:
+        user = require_user(self, ROLE_ADMIN)
+        if user is None:
+            return
+        if user["identifier"].lower() != SUPER_ADMIN_IDENTIFIER.lower():
+            send_error_json(
+                self,
+                HTTPStatus.FORBIDDEN,
+                "Solo Karly Velasquez puede reiniciar las calificaciones.",
+            )
+            return
+        with db_connect() as conn:
+            conn.execute("DELETE FROM evaluations")
+            conn.execute("DELETE FROM ranking_history")
+            conn.execute("DELETE FROM no_shows")
+            conn.execute("DELETE FROM ai_improvements")
+            conn.execute("UPDATE teams SET manual_position = NULL")
+            conn.commit()
+            record_ranking_history(conn, None)
+            conn.commit()
+            dashboard = get_admin_dashboard(conn)
+        send_json(
+            self,
+            {
+                "ok": True,
+                "message": "Todas las calificaciones fueron eliminadas. El sistema quedó como si ningún jurado hubiera votado.",
+                "dashboard": dashboard,
+            },
+        )
 
     def handle_jury_dashboard(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
@@ -1231,6 +1641,103 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
                 }
             send_json(self, {"ok": True, "team": detail, "evaluation": evaluation})
 
+    def handle_jury_no_show(self, parsed) -> None:
+        user = require_user(self, ROLE_JURY)
+        if user is None:
+            return
+        parts = [part for part in parsed.path.split("/") if part]
+        # parts look like: ['api', 'jury', 'team', '<id>', 'no-show']
+        if len(parts) < 5 or not parts[3].isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return
+        team_id = int(parts[3])
+        with db_connect() as conn:
+            team = conn.execute("SELECT id FROM teams WHERE id = ?", (team_id,)).fetchone()
+            if team is None:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+                return
+            conn.execute(
+                "INSERT OR IGNORE INTO no_shows (team_id, juror_id) VALUES (?, ?)",
+                (team_id, user["id"]),
+            )
+            conn.commit()
+
+            active_juror_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = ? AND active = 1",
+                (ROLE_JURY,),
+            ).fetchone()[0]
+            no_show_count = conn.execute(
+                "SELECT COUNT(*) FROM no_shows WHERE team_id = ?",
+                (team_id,),
+            ).fetchone()[0]
+            consensus = active_juror_count > 0 and no_show_count >= active_juror_count
+
+            if consensus:
+                max_order = conn.execute("SELECT MAX(display_order) FROM teams").fetchone()[0] or 0
+                conn.execute("UPDATE teams SET display_order = ? WHERE id = ?", (max_order + 1, team_id))
+                conn.commit()
+
+            dashboard = get_jury_dashboard(conn, user["id"], None)
+
+        if consensus:
+            message = "Todos los jurados marcaron este equipo como 'No asistió'. Se movió al final de la lista para todos."
+        else:
+            message = f"Marcaste este equipo como 'No asistió' ({no_show_count}/{active_juror_count} jurados). Continuando con el siguiente equipo pendiente."
+        send_json(self, {"ok": True, "message": message, "dashboard": dashboard})
+
+    def handle_jury_improve_observations(self, parsed) -> None:
+        user = require_user(self, ROLE_JURY)
+        if user is None:
+            return
+        parts = [part for part in parsed.path.split("/") if part]
+        # parts look like: ['api', 'jury', 'team', '<id>', 'improve-observations']
+        if len(parts) < 5 or not parts[3].isdigit():
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Equipo inválido.")
+            return
+        team_id = int(parts[3])
+
+        try:
+            payload = load_json(self)
+        except Exception:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "El cuerpo de la solicitud no es válido.")
+            return
+        original_text = str(payload.get("texto_original", "")).strip()
+        if not original_text:
+            send_error_json(self, HTTPStatus.BAD_REQUEST, "Escribe una observación antes de mejorarla con IA.")
+            return
+
+        with db_connect() as conn:
+            team = conn.execute("SELECT id FROM teams WHERE id = ?", (team_id,)).fetchone()
+            if team is None:
+                send_error_json(self, HTTPStatus.NOT_FOUND, "Equipo no encontrado.")
+                return
+            already_used = conn.execute(
+                "SELECT 1 FROM ai_improvements WHERE team_id = ? AND juror_id = ?",
+                (team_id, user["id"]),
+            ).fetchone()
+            if already_used is not None:
+                send_error_json(
+                    self,
+                    HTTPStatus.FORBIDDEN,
+                    "Ya usaste la mejora con IA para este equipo. Solo se permite una vez por equipo.",
+                )
+                return
+
+        try:
+            improved_text = improve_text_with_gemini(original_text)
+        except ValueError as exc:
+            send_error_json(self, HTTPStatus.BAD_GATEWAY, str(exc))
+            return
+
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ai_improvements (team_id, juror_id) VALUES (?, ?)",
+                (team_id, user["id"]),
+            )
+            conn.commit()
+
+        send_json(self, {"ok": True, "improved_text": improved_text})
+
     def handle_save_evaluation(self, parsed) -> None:
         user = require_user(self, ROLE_JURY)
         if user is None:
@@ -1271,7 +1778,26 @@ class InnovatePitchHandler(SimpleHTTPRequestHandler):
             send_error_json(self, HTTPStatus.CONFLICT, "Ya existe una evaluación para este equipo y jurado.")
 
 
+def load_dotenv_if_present(path: str = ".env") -> None:
+    """Load KEY=VALUE pairs from a .env file next to this script, without
+    overwriting variables already set in the real environment. No third-party
+    dependency needed (keeps this project's zero-dependency approach)."""
+    env_path = ROOT / path
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def main() -> None:
+    load_dotenv_if_present()
     initialize_database()
     server = ThreadingHTTPServer(("127.0.0.1", 8000), InnovatePitchHandler)
     print("Innovate Pitch server running at http://127.0.0.1:8000")
