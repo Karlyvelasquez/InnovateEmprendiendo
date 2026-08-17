@@ -1,0 +1,2 @@
+# Este proyecto no usa dependencias externas (todo con la librería estándar de Python).
+# Este archivo existe solo para que Railway detecte automáticamente que es una app Python.

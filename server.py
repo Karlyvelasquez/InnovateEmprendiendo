@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "innovate_pitch.db"
+DB_PATH = Path(os.environ.get("DB_PATH", str(ROOT / "innovate_pitch.db")))
 EXCEL_PATH = ROOT / "Programación_I_pitch_con_descripcion.xlsx"
 SESSION_COOKIE = "innovate_pitch_session"
 SESSION_TTL_HOURS = 24 * 7
@@ -38,21 +38,31 @@ WINNERS_COUNT = 20
 SUPER_ADMIN_IDENTIFIER = "karly.velasquez@epm.com.co"
 
 def load_seed_users() -> list[dict[str, str]]:
-    """Load the admin/jury account list from users_seed.json, which sits
-    next to this script but is NOT meant to be committed to git (it's in
-    .gitignore). See users_seed.example.json for the expected format."""
-    seed_path = ROOT / "users_seed.json"
-    if not seed_path.exists():
-        print(
-            "ADVERTENCIA: no se encontró users_seed.json junto a server.py. "
-            "No se sembrará ningún usuario. Copia users_seed.example.json a "
-            "users_seed.json y complétalo con los datos reales."
-        )
-        return []
+    """Load the admin/jury account list, preferring the USERS_SEED_JSON
+    environment variable (handy for cloud deploys like Railway, where you
+    paste the JSON directly into the platform's env var settings) and
+    falling back to users_seed.json next to this script for local dev.
+    Neither the env var value nor users_seed.json should ever be committed
+    to git. See users_seed.example.json for the expected format."""
+    raw_text = os.environ.get("USERS_SEED_JSON", "").strip()
+    source = "la variable de entorno USERS_SEED_JSON"
+    if not raw_text:
+        seed_path = ROOT / "users_seed.json"
+        source = str(seed_path)
+        if not seed_path.exists():
+            print(
+                "ADVERTENCIA: no hay USERS_SEED_JSON configurada ni se encontró "
+                "users_seed.json junto a server.py. No se sembrará ningún usuario. "
+                "Copia users_seed.example.json a users_seed.json (local) o pega su "
+                "contenido en la variable de entorno USERS_SEED_JSON (en la nube)."
+            )
+            return []
+        raw_text = seed_path.read_text(encoding="utf-8")
+
     try:
-        raw = json.loads(seed_path.read_text(encoding="utf-8"))
+        raw = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"users_seed.json tiene un error de formato JSON: {exc}") from exc
+        raise SystemExit(f"{source} tiene un error de formato JSON: {exc}") from exc
     users: list[dict[str, str]] = []
     for index, item in enumerate(raw):
         try:
@@ -65,7 +75,7 @@ def load_seed_users() -> list[dict[str, str]]:
                 }
             )
         except KeyError as exc:
-            raise SystemExit(f"users_seed.json: falta el campo {exc} en la entrada #{index + 1}.") from exc
+            raise SystemExit(f"{source}: falta el campo {exc} en la entrada #{index + 1}.") from exc
     return users
 
 
@@ -493,6 +503,7 @@ def seed_initial_history(conn: sqlite3.Connection) -> None:
 
 
 def initialize_database() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db_connect() as conn:
         ensure_schema(conn)
         seed_users(conn)
@@ -1799,8 +1810,12 @@ def load_dotenv_if_present(path: str = ".env") -> None:
 def main() -> None:
     load_dotenv_if_present()
     initialize_database()
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), InnovatePitchHandler)
-    print("Innovate Pitch server running at http://127.0.0.1:8000")
+    port = int(os.environ.get("PORT", 8000))
+    # Locally we only bind to loopback for safety. In the cloud (Railway sets
+    # PORT), we need to listen on all interfaces so the platform can reach us.
+    host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+    server = ThreadingHTTPServer((host, port), InnovatePitchHandler)
+    print(f"Innovate Pitch server running on {host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
